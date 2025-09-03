@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
 MagaDrive Ride Service
-Управление поездками, статусами, идемпотентность
+Управление поездками и событиями
 """
 
 import os
 import uuid
-import time
-from typing import Optional, Dict, Any
+import json
+import asyncio
+import sqlite3
+from datetime import datetime
+from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, String, Integer, DateTime, Text, JSON
-from sqlalchemy.sql import text
 
 # Настройка логирования
 structlog.configure(
@@ -25,7 +24,6 @@ structlog.configure(
         structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
@@ -42,15 +40,39 @@ logger = structlog.get_logger()
 
 # Модели данных
 class CreateRideRequest(BaseModel):
-    origin: Dict[str, float]  # {"lat": 55.7558, "lng": 37.6176}
-    dest: Dict[str, float]    # {"lat": 55.7517, "lng": 37.6178}
-    class_type: str            # "comfort", "business", "xl"
+    origin: str
+    destination: str
+    vehicleClass: str
+    userId: str
 
 class RideResponse(BaseModel):
-    rideId: str
+    id: str
+    userId: str
+    origin: str
+    destination: str
+    vehicleClass: str
     status: str
-    etaSec: Optional[int] = None
-    price: Optional[int] = None
+    createdAt: str
+    updatedAt: str
+    driverId: Optional[str] = None
+    driverName: Optional[str] = None
+    driverPhone: Optional[str] = None
+    vehicleNumber: Optional[str] = None
+    driverRating: Optional[float] = None
+    etaSeconds: Optional[int] = None
+    distanceMeters: Optional[float] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    cancelReason: Optional[str] = None
+    traceId: Optional[str] = None
+
+class CancelRideRequest(BaseModel):
+    reason: Optional[str] = None
+
+class ApiResponse(BaseModel):
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+    traceId: str
 
 class HealthResponse(BaseModel):
     status: str
@@ -60,65 +82,202 @@ class HealthResponse(BaseModel):
 # Конфигурация
 ENV = os.getenv("ENV", "dev")
 PORT = int(os.getenv("PORT", "7031"))
-DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///data/ride.db")
+DB_PATH = os.getenv("DB_URL", "sqlite:////data/ride.db").replace("sqlite:///", "")
 
-# SQLAlchemy setup
-Base = declarative_base()
+# WebSocket соединения
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
 
-class Ride(Base):
-    __tablename__ = "rides"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, nullable=False)
-    driver_id = Column(String, nullable=True)
-    origin = Column(JSON, nullable=False)
-    dest = Column(JSON, nullable=False)
-    class_type = Column(String, nullable=False)
-    price = Column(Integer, nullable=True)
-    currency = Column(String, default="RUB")
-    status = Column(String, default="requested")
-    eta_sec = Column(Integer, nullable=True)
-    distance_m = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime, default=text("CURRENT_TIMESTAMP"))
+    async def connect(self, websocket: WebSocket, ride_id: str):
+        await websocket.accept()
+        if ride_id not in self.active_connections:
+            self.active_connections[ride_id] = []
+        self.active_connections[ride_id].append(websocket)
+        logger.info("WebSocket connected", ride_id=ride_id, connections=len(self.active_connections[ride_id]))
 
-class IdempotencyKey(Base):
-    __tablename__ = "idempotency_keys"
-    
-    key = Column(String, primary_key=True)
-    ride_id = Column(String, nullable=False)
-    created_at = Column(DateTime, default=text("CURRENT_TIMESTAMP"))
+    def disconnect(self, websocket: WebSocket, ride_id: str):
+        if ride_id in self.active_connections:
+            self.active_connections[ride_id].remove(websocket)
+            if not self.active_connections[ride_id]:
+                del self.active_connections[ride_id]
+        logger.info("WebSocket disconnected", ride_id=ride_id)
 
-# Database engine
-engine = None
-AsyncSessionLocal = None
+    async def send_personal_message(self, message: str, ride_id: str):
+        if ride_id in self.active_connections:
+            for connection in self.active_connections[ride_id]:
+                try:
+                    await connection.send_text(message)
+                except Exception as e:
+                    logger.error("Failed to send message", error=str(e))
+                    self.disconnect(connection, ride_id)
+
+manager = ConnectionManager()
+
+# База данных
+class RideDatabase:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_db()
+
+    def init_db(self):
+        """Инициализация базы данных"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Таблица поездок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rides (
+                id TEXT PRIMARY KEY,
+                userId TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                vehicleClass TEXT NOT NULL,
+                status TEXT NOT NULL,
+                createdAt TEXT NOT NULL,
+                updatedAt TEXT NOT NULL,
+                driverId TEXT,
+                driverName TEXT,
+                driverPhone TEXT,
+                vehicleNumber TEXT,
+                driverRating REAL,
+                etaSeconds INTEGER,
+                distanceMeters REAL,
+                price REAL,
+                currency TEXT DEFAULT 'RUB',
+                cancelReason TEXT,
+                traceId TEXT
+            )
+        ''')
+        
+        # Таблица событий поездок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ride_events (
+                id TEXT PRIMARY KEY,
+                rideId TEXT NOT NULL,
+                eventType TEXT NOT NULL,
+                eventData TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (rideId) REFERENCES rides (id)
+            )
+        ''')
+        
+        # Индексы
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rides_userId ON rides (userId)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rides_status ON rides (status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ride_events_rideId ON ride_events (rideId)')
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized", db_path=self.db_path)
+
+    def create_ride(self, ride_data: Dict[str, Any]) -> str:
+        """Создание новой поездки"""
+        ride_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO rides (
+                id, userId, origin, destination, vehicleClass, status,
+                createdAt, updatedAt, traceId
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            ride_id, ride_data['userId'], ride_data['origin'], ride_data['destination'],
+            ride_data['vehicleClass'], 'requested', now, now, ride_data.get('traceId')
+        ))
+        
+        # Создаем событие RIDE_CREATED
+        event_id = str(uuid.uuid4())
+        event_data = json.dumps({
+            'rideId': ride_id,
+            'status': 'requested',
+            'timestamp': now
+        })
+        
+        cursor.execute('''
+            INSERT INTO ride_events (id, rideId, eventType, eventData, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (event_id, ride_id, 'RIDE_CREATED', event_data, now))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info("Ride created", ride_id=ride_id, user_id=ride_data['userId'])
+        return ride_id
+
+    def get_ride(self, ride_id: str) -> Optional[Dict[str, Any]]:
+        """Получение поездки по ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM rides WHERE id = ?', (ride_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            columns = [description[0] for description in cursor.description]
+            return dict(zip(columns, row))
+        return None
+
+    def update_ride_status(self, ride_id: str, status: str, **kwargs):
+        """Обновление статуса поездки"""
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Обновляем поездку
+        update_fields = ['status = ?, updatedAt = ?']
+        update_values = [status, now]
+        
+        for key, value in kwargs.items():
+            if value is not None:
+                update_fields.append(f'{key} = ?')
+                update_values.append(value)
+        
+        update_values.append(ride_id)
+        cursor.execute(f'UPDATE rides SET {", ".join(update_fields)} WHERE id = ?', update_values)
+        
+        # Создаем событие
+        event_id = str(uuid.uuid4())
+        event_data = json.dumps({
+            'rideId': ride_id,
+            'status': status,
+            'timestamp': now,
+            **kwargs
+        })
+        
+        cursor.execute('''
+            INSERT INTO ride_events (id, rideId, eventType, eventData, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (event_id, ride_id, 'RIDE_STATUS_CHANGED', event_data, now))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info("Ride status updated", ride_id=ride_id, status=status)
+
+    def cancel_ride(self, ride_id: str, reason: str):
+        """Отмена поездки"""
+        self.update_ride_status(ride_id, 'canceled', cancelReason=reason)
+        logger.info("Ride canceled", ride_id=ride_id, reason=reason)
+
+# Инициализация базы данных
+db = RideDatabase(DB_PATH)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
-    global engine, AsyncSessionLocal
-    
     logger.info("Starting Ride Service", env=ENV, port=PORT)
-    
-    # Создаем engine и сессии
-    engine = create_async_engine(DB_URL, echo=ENV == "dev")
-    AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    
-    # Создаем таблицы
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    logger.info("Database initialized")
     yield
-    
     logger.info("Shutting down Ride Service")
-    if engine:
-        await engine.dispose()
 
 # Создание FastAPI приложения
 app = FastAPI(
     title="MagaDrive Ride Service",
-    description="Управление поездками и статусами",
+    description="Сервис управления поездками",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -132,226 +291,234 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Dependency для получения сессии БД
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+# Middleware для логирования
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = datetime.now()
+    
+    trace_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    
+    logger.info(
+        "Request started",
+        method=request.method,
+        url=str(request.url),
+        trace_id=trace_id
+    )
+    
+    response = await call_next(request)
+    
+    process_time = (datetime.now() - start_time).total_seconds()
+    
+    logger.info(
+        "Request completed",
+        method=request.method,
+        url=str(request.url),
+        status_code=response.status_code,
+        process_time=process_time,
+        trace_id=trace_id
+    )
+    
+    return response
 
-# Health checks
+# Health check
 @app.get("/healthz", response_model=HealthResponse)
 async def health_check():
-    """Liveness probe"""
     return HealthResponse(
         status="healthy",
-        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        timestamp=datetime.now().isoformat(),
         service="ride-service"
     )
 
+# Ready check
 @app.get("/readyz", response_model=HealthResponse)
-async def readiness_check():
-    """Readiness probe"""
+async def ready_check():
     try:
         # Проверяем подключение к БД
-        async with AsyncSessionLocal() as session:
-            await session.execute(text("SELECT 1"))
-        
+        conn = sqlite3.connect(DB_PATH)
+        conn.close()
         return HealthResponse(
             status="ready",
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            timestamp=datetime.now().isoformat(),
             service="ride-service"
         )
     except Exception as e:
-        logger.error("Readiness check failed", error=str(e))
-        raise HTTPException(status_code=503, detail="Database not ready")
+        logger.error("Service not ready", error=str(e))
+        raise HTTPException(status_code=503, detail="Service not ready")
 
-# API роуты
-@app.post("/rides", response_model=RideResponse)
-async def create_ride(request: CreateRideRequest, db: AsyncSession = Depends(get_db)):
-    """Создание новой поездки"""
+# Создание поездки
+@app.post("/rides", response_model=ApiResponse)
+async def create_ride(request: CreateRideRequest, req: Request):
     try:
-        # Проверяем идемпотентность
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if not idempotency_key:
-            raise HTTPException(status_code=400, detail="Idempotency-Key header required")
+        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
         
-        # Проверяем, не использовался ли уже этот ключ
-        existing_key = await db.execute(
-            text("SELECT ride_id FROM idempotency_keys WHERE key = :key"),
-            {"key": idempotency_key}
-        )
-        existing_result = existing_key.fetchone()
-        
-        if existing_result:
-            # Возвращаем существующую поездку
-            ride_id = existing_result[0]
-            ride = await db.execute(
-                text("SELECT * FROM rides WHERE id = :ride_id"),
-                {"ride_id": ride_id}
-            )
-            ride_data = ride.fetchone()
-            
-            return RideResponse(
-                rideId=ride_data[0],
-                status=ride_data[8],  # status
-                etaSec=ride_data[9],  # eta_sec
-                price=ride_data[6]    # price
-            )
-        
-        # Создаем новую поездку
-        ride_id = str(uuid.uuid4())
-        
-        # Простой расчет цены (позже заменим на pricing service)
-        base_price = {"comfort": 1000, "business": 2000, "xl": 3000}
-        price = base_price.get(request.class_type, 1000)
-        
-        # Простой расчет ETA (позже заменим на geo service)
-        # Haversine формула для примерного расчета
-        import math
-        lat1, lng1 = request.origin["lat"], request.origin["lng"]
-        lat2, lng2 = request.dest["lat"], request.dest["lng"]
-        
-        R = 6371000  # радиус Земли в метрах
-        lat1_rad = math.radians(lat1)
-        lat2_rad = math.radians(lat2)
-        delta_lat = math.radians(lat2 - lat1)
-        delta_lng = math.radians(lng2 - lng1)
-        
-        a = (math.sin(delta_lat/2) * math.sin(delta_lat/2) +
-             math.cos(lat1_rad) * math.cos(lat2_rad) *
-             math.sin(delta_lng/2) * math.sin(delta_lng/2))
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        distance_m = int(R * c)
-        
-        # Примерное время в пути (средняя скорость 15 м/с)
-        eta_sec = int(distance_m / 15)
-        
-        # Сохраняем поездку
-        await db.execute(
-            text("""
-                INSERT INTO rides (id, user_id, origin, dest, class_type, price, 
-                                 currency, status, eta_sec, distance_m)
-                VALUES (:id, :user_id, :origin, :dest, :class_type, :price,
-                       :currency, :status, :eta_sec, :distance_m)
-            """),
-            {
-                "id": ride_id,
-                "user_id": str(uuid.uuid4()),  # Временно генерируем
-                "origin": request.origin,
-                "dest": request.dest,
-                "class_type": request.class_type,
-                "price": price,
-                "currency": "RUB",
-                "status": "requested",
-                "eta_sec": eta_sec,
-                "distance_m": distance_m
-            }
-        )
-        
-        # Сохраняем ключ идемпотентности
-        await db.execute(
-            text("INSERT INTO idempotency_keys (key, ride_id) VALUES (:key, :ride_id)"),
-            {"key": idempotency_key, "ride_id": ride_id}
-        )
-        
-        await db.commit()
-        
-        logger.info("Ride created", ride_id=ride_id, class_type=request.class_type)
-        
-        return RideResponse(
-            rideId=ride_id,
-            status="requested",
-            etaSec=eta_sec,
-            price=price
-        )
-        
-    except Exception as e:
-        await db.rollback()
-        logger.error("Create ride failed", error=str(e))
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/rides/{ride_id}")
-async def get_ride(ride_id: str, db: AsyncSession = Depends(get_db)):
-    """Получение информации о поездке"""
-    try:
-        result = await db.execute(
-            text("SELECT * FROM rides WHERE id = :ride_id"),
-            {"ride_id": ride_id}
-        )
-        ride_data = result.fetchone()
-        
-        if not ride_data:
-            raise HTTPException(status_code=404, detail="Ride not found")
-        
-        # Преобразуем в словарь
-        ride = {
-            "id": ride_data[0],
-            "userId": ride_data[1],
-            "driverId": ride_data[2],
-            "origin": ride_data[3],
-            "dest": ride_data[4],
-            "class": ride_data[5],
-            "price": ride_data[6],
-            "currency": ride_data[7],
-            "status": ride_data[8],
-            "etaSec": ride_data[9],
-            "distanceM": ride_data[10],
-            "createdAt": ride_data[11].isoformat() if ride_data[11] else None,
-            "updatedAt": ride_data[12].isoformat() if ride_data[12] else None
+        ride_data = {
+            'userId': request.userId,
+            'origin': request.origin,
+            'destination': request.destination,
+            'vehicleClass': request.vehicleClass,
+            'traceId': trace_id
         }
         
-        return ride
+        ride_id = db.create_ride(ride_data)
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Get ride failed", error=str(e))
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/rides/{ride_id}/cancel")
-async def cancel_ride(ride_id: str, db: AsyncSession = Depends(get_db)):
-    """Отмена поездки"""
-    try:
-        # Проверяем существование поездки
-        result = await db.execute(
-            text("SELECT status FROM rides WHERE id = :ride_id"),
-            {"ride_id": ride_id}
+        # Получаем созданную поездку
+        ride = db.get_ride(ride_id)
+        
+        # Отправляем событие через WebSocket
+        event_data = {
+            'type': 'RIDE_CREATED',
+            'eventId': str(uuid.uuid4()),
+            'data': {
+                'rideId': ride_id,
+                'status': 'requested',
+                'timestamp': datetime.now().isoformat()
+            }
+        }
+        
+        await manager.send_personal_message(json.dumps(event_data), ride_id)
+        
+        # Запускаем симуляцию назначения водителя
+        asyncio.create_task(simulate_driver_assignment(ride_id))
+        
+        return ApiResponse(
+            data=ride,
+            traceId=trace_id
         )
-        ride_data = result.fetchone()
         
-        if not ride_data:
+    except Exception as e:
+        logger.error("Failed to create ride", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Получение поездки
+@app.get("/rides/{ride_id}", response_model=ApiResponse)
+async def get_ride(ride_id: str, req: Request):
+    try:
+        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
+        
+        ride = db.get_ride(ride_id)
+        if not ride:
             raise HTTPException(status_code=404, detail="Ride not found")
         
-        current_status = ride_data[0]
-        if current_status in ["completed", "canceled"]:
-            raise HTTPException(status_code=400, detail="Cannot cancel completed or canceled ride")
-        
-        # Отменяем поездку
-        await db.execute(
-            text("UPDATE rides SET status = 'canceled', updated_at = CURRENT_TIMESTAMP WHERE id = :ride_id"),
-            {"ride_id": ride_id}
+        return ApiResponse(
+            data=ride,
+            traceId=trace_id
         )
-        
-        await db.commit()
-        
-        logger.info("Ride canceled", ride_id=ride_id)
-        
-        return {"status": "canceled"}
         
     except HTTPException:
         raise
     except Exception as e:
-        await db.rollback()
-        logger.error("Cancel ride failed", error=str(e))
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error("Failed to get ride", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Отмена поездки
+@app.post("/rides/{ride_id}/cancel", response_model=ApiResponse)
+async def cancel_ride(ride_id: str, request: CancelRideRequest, req: Request):
+    try:
+        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
+        
+        ride = db.get_ride(ride_id)
+        if not ride:
+            raise HTTPException(status_code=404, detail="Ride not found")
+        
+        if ride['status'] not in ['requested', 'searching', 'assigned', 'onTheWay']:
+            raise HTTPException(status_code=400, detail="Cannot cancel ride in current status")
+        
+        db.cancel_ride(ride_id, request.reason or "User canceled")
+        
+        # Отправляем событие через WebSocket
+        event_data = {
+            'type': 'RIDE_CANCELED',
+            'eventId': str(uuid.uuid4()),
+            'data': {
+                'rideId': ride_id,
+                'status': 'canceled',
+                'reason': request.reason or "User canceled",
+                'timestamp': datetime.now().isoformat()
+            }
+        }
+        
+        await manager.send_personal_message(json.dumps(event_data), ride_id)
+        
+        return ApiResponse(
+            data={'status': 'canceled'},
+            traceId=trace_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to cancel ride", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# WebSocket для событий поездки
+@app.websocket("/ws/ride/{ride_id}")
+async def websocket_endpoint(websocket: WebSocket, ride_id: str):
+    await manager.connect(websocket, ride_id)
+    try:
+        while True:
+            # Ожидаем сообщения от клиента
+            data = await websocket.receive_text()
+            logger.info("WebSocket message received", ride_id=ride_id, data=data)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, ride_id)
+
+# Симуляция назначения водителя
+async def simulate_driver_assignment(ride_id: str):
+    """Симуляция назначения водителя через 2-5 секунд"""
+    try:
+        # Случайная задержка 2-5 секунд
+        delay = 2 + (hash(ride_id) % 3)
+        await asyncio.sleep(delay)
+        
+        # Назначаем водителя
+        driver_data = {
+            'driverId': f'driver_{uuid.uuid4().hex[:8]}',
+            'driverName': 'Александр Петров',
+            'driverPhone': '+7 (999) 123-45-67',
+            'vehicleNumber': 'А 123 БВ 77',
+            'driverRating': 4.8,
+            'etaSeconds': 300,  # 5 минут
+            'distanceMeters': 2500.0
+        }
+        
+        db.update_ride_status(ride_id, 'assigned', **driver_data)
+        
+        # Отправляем событие DRIVER_ASSIGNED
+        event_data = {
+            'type': 'DRIVER_ASSIGNED',
+            'eventId': str(uuid.uuid4()),
+            'data': {
+                'rideId': ride_id,
+                'status': 'assigned',
+                'timestamp': datetime.now().isoformat(),
+                **driver_data
+            }
+        }
+        
+        await manager.send_personal_message(json.dumps(event_data), ride_id)
+        
+        # Через 2 секунды отправляем ETA_UPDATE
+        await asyncio.sleep(2)
+        
+        eta_event_data = {
+            'type': 'ETA_UPDATE',
+            'eventId': str(uuid.uuid4()),
+            'data': {
+                'rideId': ride_id,
+                'etaSeconds': 180,  # 3 минуты
+                'distanceMeters': 2000.0,
+                'timestamp': datetime.now().isoformat()
+            }
+        }
+        
+        await manager.send_personal_message(json.dumps(eta_event_data), ride_id)
+        
+        logger.info("Driver assignment simulation completed", ride_id=ride_id)
+        
+    except Exception as e:
+        logger.error("Driver assignment simulation failed", error=str(e), ride_id=ride_id)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=ENV == "dev"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

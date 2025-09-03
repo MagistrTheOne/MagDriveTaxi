@@ -1,21 +1,34 @@
 ﻿{
-  "version": 8,
-  "name": "MagaDrive Dark Gold",
-  "sources": {
-    "maptiler": {
-      "type": "vector",
-      "url": "https://api.maptiler.com/tiles/v3/tiles.json?key=SjhYKAeXJxWy3pPcQc2G"
-    }
-  },
-  "sprite": "https://api.maptiler.com/maps/streets/sprite?key=SjhYKAeXJxWy3pPcQc2G",
-  "glyphs": "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=SjhYKAeXJxWy3pPcQc2G",
-  "layers": [
-    { "id": "background", "type": "background", "paint": { "background-color": "#0B0B0E" }},
-    { "id": "land", "type": "fill", "source": "maptiler", "source-layer": "land", "paint": { "fill-color": "#111217" }},
-    { "id": "water", "type": "fill", "source": "maptiler", "source-layer": "water", "paint": { "fill-color": "#0A0B0E" }},
-    { "id": "road-major", "type": "line", "source": "maptiler", "source-layer": "transportation", "filter": ["in","class","motorway","trunk","primary"], "paint": { "line-color": "#D4AF37", "line-width": 1.6 }},
-    { "id": "road-minor", "type": "line", "source": "maptiler", "source-layer": "transportation", "filter": ["in","class","secondary","tertiary","residential","service"], "paint": { "line-width": 1.0 }},
-    { "id": "building", "type": "fill", "source": "maptiler", "source-layer": "building", "paint": { "fill-color": "#151620", "fill-outline-color": "#1B1C26" }},
-    { "id": "place-label", "type": "symbol", "source": "maptiler", "source-layer": "place", "layout": { "text-field": ["get","name"], "text-size": 12, "text-font": ["Roboto Regular"] }, "paint": { "text-color": "#A6A9B1" }}
-  ]
+    "version":  8,
+    "sources":  {
+                    "maptiler":  {
+                                     "url":  "https://api.maptiler.com/maps/streets/{z}/{x}/{y}.png?key=SjhYKAeXJxWy3pPcQc2G",
+                                     "tileSize":  256,
+                                     "type":  "raster",
+                                     "attribution":  "В© MapTiler В© OpenStreetMap contributors"
+                                 }
+                },
+    "glyphs":  "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=SjhYKAeXJxWy3pPcQc2G",
+    "layers":  [
+                   {
+                       "id":  "background",
+                       "type":  "background",
+                       "paint":  {
+                                     "background-color":  "#0B0B0E"
+                                 }
+                   },
+                   {
+                       "source":  "maptiler",
+                       "id":  "maptiler",
+                       "type":  "raster",
+                       "paint":  {
+                                     "raster-brightness-max":  0.8,
+                                     "raster-opacity":  0.7,
+                                     "raster-brightness-min":  0.1,
+                                     "raster-saturation":  -0.3
+                                 }
+                   }
+               ],
+    "sprite":  "https://api.maptiler.com/maps/streets/sprite?key=SjhYKAeXJxWy3pPcQc2G",
+    "name":  "MagaDrive Dark Gold"
 }

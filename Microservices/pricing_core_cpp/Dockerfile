@@ -1,34 +1,41 @@
-FROM ubuntu:22.04
+FROM gcc:11 as builder
 
-# Установка системных зависимостей
+# Устанавливаем зависимости для сборки
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    cmake \
-    pkg-config \
-    libmicrohttpd-dev \
+    nlohmann-json3-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем исходный код
+WORKDIR /app
+COPY . .
+
+# Собираем приложение
+RUN make clean && make
+
+# Создаем минимальный образ
+FROM debian:bullseye-slim
+
+# Устанавливаем runtime зависимости
+RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Копируем собранное приложение
+COPY --from=builder /app/pricing_service /usr/local/bin/
 
-# Копирование исходного кода
-COPY . .
+# Создаем пользователя для безопасности
+RUN useradd -r -s /bin/false pricing && \
+    chown pricing:pricing /usr/local/bin/pricing_service
 
-# Сборка приложения
-RUN mkdir build && cd build \
-    && cmake .. \
-    && make -j$(nproc) \
-    && chmod +x pricing_core_cpp
+USER pricing
 
-# Создание пользователя для безопасности
-RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
-USER app
-
-# Health check
-HEALTHCHECK --interval=10s --timeout=2s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:7010/healthz || exit 1
-
+# Открываем порт
 EXPOSE 7010
 
-# Запуск приложения
-CMD ["./build/pricing_core_cpp"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:7010/healthz || exit 1
+
+# Запускаем приложение
+CMD ["/usr/local/bin/pricing_service"]

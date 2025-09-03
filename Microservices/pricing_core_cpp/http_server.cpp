@@ -10,7 +10,9 @@ namespace magadrive {
 HttpServer::HttpServer(int port) : daemon_(nullptr), port_(port), running_(false) {
     // Регистрируем стандартные обработчики
     registerHandler("/healthz", "GET", healthHandler);
+    registerHandler("/readyz", "GET", healthHandler);
     registerHandler("/pricing", "POST", pricingHandler);
+    registerHandler("/price", "POST", pricingHandler);
 }
 
 HttpServer::~HttpServer() {
