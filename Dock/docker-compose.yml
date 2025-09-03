@@ -1,0 +1,88 @@
+version: "3.9"
+
+networks:
+  magadrive_net:
+    driver: bridge
+
+volumes:
+  ride_data:
+
+secrets:
+  firebase_admin.json:
+    file: ../secrets/firebase_admin.json
+
+services:
+  gateway:
+    build: ../Microservices/api-gateway_py
+    ports:
+      - "8080:8080"
+    environment:
+      - ENV=dev
+      - RIDES_URL=http://ride:7031
+      - GEO_URL=http://geo:7032
+      - PRICING_URL=http://pricing:7010
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase_admin.json
+      - FIREBASE_PROJECT_ID=magadrive-34f8d
+    secrets:
+      - firebase_admin.json
+    depends_on:
+      - ride
+      - geo
+      - pricing
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+    networks:
+      - magadrive_net
+
+  ride:
+    build: ../Microservices/ride_service_py
+    environment:
+      - ENV=dev
+      - PORT=7031
+      - DB_URL=sqlite:////data/ride.db
+      - EVENT_BUS=ws
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase_admin.json
+      - FIREBASE_PROJECT_ID=magadrive-34f8d
+    secrets:
+      - firebase_admin.json
+    volumes:
+      - ride_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7031/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+    networks:
+      - magadrive_net
+
+  geo:
+    build: ../Microservices/geo_service_py
+    environment:
+      - ENV=dev
+      - PORT=7032
+      - MAP_GEO_PROVIDER=maptiler
+      - MAPTILER_API_KEY=${MAPTILER_API_KEY}
+      - CACHE_TTL_SEC=600
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7032/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+    networks:
+      - magadrive_net
+
+  pricing:
+    build: ../Microservices/pricing_core_cpp
+    environment:
+      - ENV=dev
+      - PORT=7010
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7010/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+    networks:
+      - magadrive_net

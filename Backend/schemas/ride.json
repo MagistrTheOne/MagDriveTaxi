@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Ride",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Уникальный идентификатор поездки"
+    },
+    "userId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Идентификатор пользователя"
+    },
+    "driverId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Идентификатор водителя (опционально)"
+    },
+    "origin": {
+      "type": "object",
+      "properties": {
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90,
+          "description": "Широта точки отправления"
+        },
+        "lng": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180,
+          "description": "Долгота точки отправления"
+        },
+        "address": {
+          "type": "string",
+          "description": "Адрес точки отправления"
+        }
+      },
+      "required": ["lat", "lng"],
+      "additionalProperties": false
+    },
+    "dest": {
+      "type": "object",
+      "properties": {
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90,
+          "description": "Широта точки назначения"
+        },
+        "lng": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180,
+          "description": "Долгота точки назначения"
+        },
+        "address": {
+          "type": "string",
+          "description": "Адрес точки назначения"
+        }
+      },
+      "required": ["lat", "lng"],
+      "additionalProperties": false
+    },
+    "class": {
+      "type": "string",
+      "enum": ["comfort", "business", "xl"],
+      "description": "Класс автомобиля"
+    },
+    "price": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Стоимость поездки в копейках"
+    },
+    "currency": {
+      "type": "string",
+      "enum": ["RUB"],
+      "description": "Валюта"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["requested", "accepted", "arriving", "ontrip", "completed", "canceled"],
+      "description": "Статус поездки"
+    },
+    "etaSec": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Время в пути в секундах"
+    },
+    "distanceM": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Расстояние в метрах"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Дата и время создания поездки"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Дата и время последнего обновления"
+    }
+  },
+  "required": ["id", "userId", "origin", "dest", "class", "price", "currency", "status", "createdAt", "updatedAt"],
+  "additionalProperties": false
+}

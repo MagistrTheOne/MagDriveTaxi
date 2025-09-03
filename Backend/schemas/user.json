@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "User",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Уникальный идентификатор пользователя"
+    },
+    "phone": {
+      "type": "string",
+      "pattern": "^\\+7[0-9]{10}$",
+      "description": "Номер телефона в формате +79XXXXXXXXX"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "Имя пользователя"
+    },
+    "role": {
+      "type": "string",
+      "enum": ["user", "driver", "admin"],
+      "description": "Роль пользователя в системе"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Дата и время создания пользователя"
+    }
+  },
+  "required": ["id", "phone", "name", "role", "createdAt"],
+  "additionalProperties": false
+}
