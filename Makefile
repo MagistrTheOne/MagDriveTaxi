@@ -42,6 +42,23 @@ prod-style:
 	fi
 	@powershell -ExecutionPolicy Bypass -File "scripts/generate_map_style.ps1" -Flavor "prod" -MapTilerKey "$(MAPTILER_KEY)"
 
+# Flutter APK builds
+dev-apk:
+	@echo "Building dev APK..."
+	cd Frontend && powershell -ExecutionPolicy Bypass -File "build_apk.ps1" -Flavor "dev"
+
+stage-apk:
+	@echo "Building stage APK..."
+	cd Frontend && powershell -ExecutionPolicy Bypass -File "build_apk.ps1" -Flavor "stage"
+
+prod-apk:
+	@echo "Building production APK..."
+	cd Frontend && powershell -ExecutionPolicy Bypass -File "build_apk.ps1" -Flavor "prod"
+
+release-apk:
+	@echo "Building release APK for current flavor..."
+	cd Frontend && powershell -ExecutionPolicy Bypass -File "build_apk.ps1" -Flavor "dev" -Release
+
 # Docker commands
 docker-up:
 	@echo "Starting MagaDrive services..."
