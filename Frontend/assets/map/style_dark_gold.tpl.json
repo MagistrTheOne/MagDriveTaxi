@@ -1,21 +1,41 @@
 {
   "version": 8,
   "name": "MagaDrive Dark Gold",
+  "sprite": "https://api.maptiler.com/maps/streets/sprite",
+  "glyphs": "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf",
   "sources": {
     "maptiler": {
-      "type": "vector",
-      "url": "https://api.maptiler.com/tiles/v3/tiles.json?key=${MAPTILER_API_KEY}"
+      "type": "raster",
+      "tiles": [
+        "https://api.maptiler.com/maps/streets/{z}/{x}/{y}.png?key=${MAPTILER_API_KEY}"
+      ],
+      "tileSize": 256,
+      "attribution": "© MapTiler © OpenStreetMap contributors"
     }
   },
-  "sprite": "https://api.maptiler.com/maps/streets/sprite?key=${MAPTILER_API_KEY}",
-  "glyphs": "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=${MAPTILER_API_KEY}",
   "layers": [
-    { "id": "background", "type": "background", "paint": { "background-color": "#0B0B0E" }},
-    { "id": "land", "type": "fill", "source": "maptiler", "source-layer": "land", "paint": { "fill-color": "#111217" }},
-    { "id": "water", "type": "fill", "source": "maptiler", "source-layer": "water", "paint": { "fill-color": "#0A0B0E" }},
-    { "id": "road-major", "type": "line", "source": "maptiler", "source-layer": "transportation", "filter": ["in","class","motorway","trunk","primary"], "paint": { "line-color": "#D4AF37", "line-width": 1.6 }},
-    { "id": "road-minor", "type": "line", "source": "maptiler", "source-layer": "transportation", "filter": ["in","class","secondary","tertiary","residential","service"], "paint": { "line-width": 1.0 }},
-    { "id": "building", "type": "fill", "source": "maptiler", "source-layer": "building", "paint": { "fill-color": "#151620", "fill-outline-color": "#1B1C26" }},
-    { "id": "place-label", "type": "symbol", "source": "maptiler", "source-layer": "place", "layout": { "text-field": ["get","name"], "text-size": 12, "text-font": ["Roboto Regular"] }, "paint": { "text-color": "#A6A9B1" }}
-  ]
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#0B0B0E"
+      }
+    },
+    {
+      "id": "maptiler-raster",
+      "type": "raster",
+      "source": "maptiler",
+      "paint": {
+        "raster-opacity": 0.8,
+        "raster-saturation": -0.3,
+        "raster-contrast": 0.2,
+        "raster-brightness-min": 0.1
+      }
+    }
+  ],
+  "metadata": {
+    "maptiler:copyright": "© MapTiler © OpenStreetMap contributors",
+    "maptiler:version": "1.0.0",
+    "maptiler:style": "dark_gold"
+  }
 }

@@ -1,41 +1,58 @@
-FROM gcc:11 as builder
+# Multi-stage build для C++ Pricing Service
+FROM ubuntu:22.04 as builder
 
-# Устанавливаем зависимости для сборки
+# Установка зависимостей для сборки
 RUN apt-get update && apt-get install -y \
-    nlohmann-json3-dev \
-    make \
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем исходный код
+# Рабочая директория
 WORKDIR /app
+
+# Копируем исходники и vendor
 COPY . .
 
 # Собираем приложение
-RUN make clean && make
+RUN make build
 
-# Создаем минимальный образ
-FROM debian:bullseye-slim
+# Production образ
+FROM ubuntu:22.04
 
-# Устанавливаем runtime зависимости
+# Установка runtime зависимостей
 RUN apt-get update && apt-get install -y \
     curl \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
+# Создаем пользователя
+RUN useradd --create-home --shell /bin/bash app
+
+# Рабочая директория
+WORKDIR /app
+
 # Копируем собранное приложение
-COPY --from=builder /app/pricing_service /usr/local/bin/
+COPY --from=builder /app/pricing_service .
 
-# Создаем пользователя для безопасности
-RUN useradd -r -s /bin/false pricing && \
-    chown pricing:pricing /usr/local/bin/pricing_service
+# Устанавливаем права
+RUN chown app:app pricing_service && chmod +x pricing_service
 
-USER pricing
+USER app
 
-# Открываем порт
-EXPOSE 7010
+# Переменные окружения
+ENV PORT=8003
+ENV BASE_PRICE=100.0
+ENV PRICE_PER_KM=15.0
+ENV PRICE_PER_MINUTE=3.0
+
+# Порт
+EXPOSE 8003
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:7010/healthz || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8003/healthz || exit 1
 
-# Запускаем приложение
-CMD ["/usr/local/bin/pricing_service"]
+# Команда запуска
+CMD ["./pricing_service"]

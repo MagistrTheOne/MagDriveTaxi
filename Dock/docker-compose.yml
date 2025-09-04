@@ -15,35 +15,40 @@ services:
   gateway:
     build: ../Microservices/api-gateway_py
     ports:
-      - "8080:8080"
+      - "8080:8000"  # Gateway порт изменен на 8000
     environment:
       - ENV=dev
-      - RIDES_URL=http://ride:7031
-      - GEO_URL=http://geo:7032
-      - PRICING_URL=http://pricing:7010
+      - RIDE_SERVICE_URL=http://ride:8001
+      - GEO_SERVICE_URL=http://geo:8002  
+      - PRICING_SERVICE_URL=http://pricing:8003
       - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase_admin.json
       - FIREBASE_PROJECT_ID=magadrive-34f8d
     secrets:
       - firebase_admin.json
     depends_on:
-      - ride
-      - geo
-      - pricing
+      ride:
+        condition: service_healthy
+      geo:
+        condition: service_healthy
+      pricing:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
       interval: 10s
-      timeout: 2s
+      timeout: 5s
       retries: 12
+      start_period: 30s
     networks:
       - magadrive_net
+    restart: unless-stopped
 
   ride:
     build: ../Microservices/ride_service_py
     environment:
       - ENV=dev
-      - PORT=7031
-      - DB_URL=sqlite:////data/ride.db
-      - EVENT_BUS=ws
+      - PORT=8001
+      - DB_PATH=/data/ride.db
+      - GATEWAY_URL=http://gateway:8000
       - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase_admin.json
       - FIREBASE_PROJECT_ID=magadrive-34f8d
     secrets:
@@ -51,38 +56,48 @@ services:
     volumes:
       - ride_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:7031/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/healthz"]
       interval: 10s
-      timeout: 2s
+      timeout: 5s
       retries: 12
+      start_period: 20s
     networks:
       - magadrive_net
+    restart: unless-stopped
 
   geo:
     build: ../Microservices/geo_service_py
     environment:
       - ENV=dev
-      - PORT=7032
-      - MAP_GEO_PROVIDER=maptiler
-      - MAPTILER_API_KEY=${MAPTILER_API_KEY}
-      - CACHE_TTL_SEC=600
+      - PORT=8002
+      - MAPTILER_API_KEY=${MAPTILER_API_KEY:-SjhYKAeXJxWy3pPcQc2G}
+      - CACHE_TTL=600
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:7032/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/healthz"]
       interval: 10s
-      timeout: 2s
+      timeout: 5s
       retries: 12
+      start_period: 15s
     networks:
       - magadrive_net
+    restart: unless-stopped
 
   pricing:
     build: ../Microservices/pricing_core_cpp
     environment:
       - ENV=dev
-      - PORT=7010
+      - PORT=8003
+      - BASE_PRICE=100.0
+      - PRICE_PER_KM=15.0
+      - PRICE_PER_MINUTE=3.0
+      - DEMAND_COEFF_MIN=1.0
+      - DEMAND_COEFF_MAX=1.4
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:7010/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8003/healthz"]
       interval: 10s
-      timeout: 2s
+      timeout: 5s
       retries: 12
+      start_period: 10s
     networks:
       - magadrive_net
+    restart: unless-stopped

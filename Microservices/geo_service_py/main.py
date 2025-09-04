@@ -1,151 +1,60 @@
 #!/usr/bin/env python3
 """
-MagaDrive Geo Service
-Геолокация, маршруты и водители
+MagaDrive Geo Service - T8-T10
+Прокси MapTiler Directions и заглушка водителей
 """
 
-import os
-import uuid
-import json
 import asyncio
-import random
+import json
+import logging
+import os
 import time
-from datetime import datetime
-from typing import Optional, Dict, Any, List
-from contextlib import asynccontextmanager
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
+import random
+import math
 
-import httpx
-import structlog
-from fastapi import FastAPI, Request, HTTPException
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import httpx
 from pydantic import BaseModel
 
 # Настройка логирования
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s", "traceId": "%(traceId)s"}',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-logger = structlog.get_logger()
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        record.traceId = getattr(record, 'traceId', 'unknown')
+        return super().format(record)
 
-# Модели данных
-class RouteRequest(BaseModel):
-    origin: str
-    destination: str
-
-class RouteResponse(BaseModel):
-    etaSeconds: int
-    distanceMeters: float
-
-class DriverLocation(BaseModel):
-    id: str
-    latitude: float
-    longitude: float
-    heading: float
-    status: str
-    lastUpdate: str
-
-class ApiResponse(BaseModel):
-    data: Optional[Dict[str, Any]] = None
-    error: Optional[Dict[str, Any]] = None
-    traceId: str
-
-class HealthResponse(BaseModel):
-    status: str
-    timestamp: str
-    service: str
+logger = logging.getLogger(__name__)
+logger.handlers[0].setFormatter(CustomFormatter())
 
 # Конфигурация
-ENV = os.getenv("ENV", "dev")
-PORT = int(os.getenv("PORT", "7032"))
-MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY", "")
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))
+MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY', 'SjhYKAeXJxWy3pPcQc2G')
+MAPTILER_BASE_URL = 'https://api.maptiler.com/directions/driving'
+CACHE_TTL = int(os.getenv('CACHE_TTL', '600'))  # 10 минут
 
 # HTTP клиент
 http_client = httpx.AsyncClient(timeout=10.0)
 
-# Кэш маршрутов
+# Кэш для ETA запросов
 route_cache: Dict[str, Dict[str, Any]] = {}
 
-# Заглушка водителей
-mock_drivers: List[Dict[str, Any]] = []
+# Заглушка водителей в памяти
+fake_drivers = []
 
-def init_mock_drivers():
-    """Инициализация заглушки водителей"""
-    global mock_drivers
-    
-    # Создаем 10 водителей в центре Москвы
-    for i in range(10):
-        mock_drivers.append({
-            'id': f'driver_{i:03d}',
-            'latitude': 55.7558 + (random.random() - 0.5) * 0.01,  # ±5 км
-            'longitude': 37.6176 + (random.random() - 0.5) * 0.01,
-            'heading': random.random() * 360,
-            'status': 'available',
-            'lastUpdate': datetime.now().isoformat()
-        })
-    
-    logger.info("Mock drivers initialized", count=len(mock_drivers))
-
-def update_mock_drivers():
-    """Обновление позиций водителей-заглушек"""
-    global mock_drivers
-    
-    for driver in mock_drivers:
-        # Легкий дрейф позиции
-        driver['latitude'] += (random.random() - 0.5) * 0.0001
-        driver['longitude'] += (random.random() - 0.5) * 0.0001
-        driver['heading'] += (random.random() - 0.5) * 10
-        driver['heading'] %= 360
-        driver['lastUpdate'] = datetime.now().isoformat()
-        
-        # Случайно меняем статус
-        if random.random() < 0.1:  # 10% вероятность
-            driver['status'] = random.choice(['available', 'busy', 'offline'])
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Управление жизненным циклом приложения"""
-    logger.info("Starting Geo Service", env=ENV, port=PORT)
-    
-    # Инициализируем заглушку водителей
-    init_mock_drivers()
-    
-    # Запускаем обновление водителей
-    asyncio.create_task(driver_update_task())
-    
-    yield
-    logger.info("Shutting down Geo Service")
-    await http_client.aclose()
-
-async def driver_update_task():
-    """Задача обновления позиций водителей"""
-    while True:
-        try:
-            update_mock_drivers()
-            await asyncio.sleep(1)  # Обновляем каждую секунду
-        except Exception as e:
-            logger.error("Driver update task failed", error=str(e))
-            await asyncio.sleep(5)
-
-# Создание FastAPI приложения
 app = FastAPI(
     title="MagaDrive Geo Service",
-    description="Сервис геолокации и маршрутов",
-    version="1.0.0",
-    lifespan=lifespan
+    description="Сервис геолокации и маршрутизации T8-T10",
+    version="1.0.0"
 )
 
 # CORS middleware
@@ -157,252 +66,358 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Middleware для логирования
+# Модели данных
+class RouteEtaRequest(BaseModel):
+    originLat: float
+    originLng: float
+    destLat: float
+    destLng: float
+
+class DriversRequest(BaseModel):
+    lat: float
+    lng: float
+    radius: Optional[float] = 5000
+
+class Driver(BaseModel):
+    id: str
+    name: str
+    phone: str
+    rating: float
+    vehicleClass: str
+    vehicleNumber: str
+    lat: float
+    lng: float
+    heading: Optional[float] = None
+    speed: Optional[float] = None
+    eta: Optional[int] = None
+    distance: Optional[float] = None
+
+# Инициализация заглушки водителей
+def init_fake_drivers():
+    """Инициализация заглушки водителей в памяти"""
+    global fake_drivers
+    
+    # Генерируем 20-30 водителей вокруг Москвы
+    moscow_center_lat = 55.7558
+    moscow_center_lng = 37.6176
+    
+    names = ['Алексей', 'Дмитрий', 'Сергей', 'Андрей', 'Михаил', 'Владимир', 'Александр', 'Николай']
+    vehicle_classes = ['economy', 'comfort', 'business']
+    
+    for i in range(25):
+        # Случайное расположение в радиусе 10 км от центра
+        angle = random.uniform(0, 2 * math.pi)
+        radius_km = random.uniform(1, 10)
+        
+        # Преобразуем км в градусы (примерно)
+        lat_offset = (radius_km / 111.0) * math.cos(angle)
+        lng_offset = (radius_km / (111.0 * math.cos(math.radians(moscow_center_lat)))) * math.sin(angle)
+        
+        driver = {
+            "id": f"driver_{i+1000}",
+            "name": f"{random.choice(names)} {chr(65 + i)}.",
+            "phone": f"+7 (999) {random.randint(100, 999)}-{random.randint(10, 99)}-{random.randint(10, 99)}",
+            "rating": round(random.uniform(4.0, 5.0), 1),
+            "vehicleClass": random.choice(vehicle_classes),
+            "vehicleNumber": f"{random.choice(['А', 'В', 'Е', 'К', 'М'])}{random.randint(100, 999)}{random.choice(['АА', 'ВВ', 'ЕЕ'])}77",
+            "lat": moscow_center_lat + lat_offset,
+            "lng": moscow_center_lng + lng_offset,
+            "heading": random.uniform(0, 360),
+            "speed": random.uniform(0, 60),  # км/ч
+            "lastUpdate": datetime.utcnow()
+        }
+        
+        fake_drivers.append(driver)
+    
+    logger.info(f"Initialized {len(fake_drivers)} fake drivers")
+
+# Инициализация при старте
+init_fake_drivers()
+
+# Фоновая задача для обновления позиций водителей
+async def update_drivers_positions():
+    """Фоновое обновление позиций водителей каждую секунду"""
+    while True:
+        try:
+            for driver in fake_drivers:
+                # Небольшое случайное движение
+                lat_delta = random.uniform(-0.0005, 0.0005)  # ~50 метров
+                lng_delta = random.uniform(-0.0005, 0.0005)
+                
+                driver["lat"] += lat_delta
+                driver["lng"] += lng_delta
+                driver["heading"] = (driver["heading"] + random.uniform(-10, 10)) % 360
+                driver["speed"] = max(0, min(80, driver["speed"] + random.uniform(-5, 5)))
+                driver["lastUpdate"] = datetime.utcnow()
+            
+            await asyncio.sleep(1)  # Обновляем каждую секунду
+            
+        except Exception as e:
+            logger.error(f"Failed to update drivers positions: {e}")
+            await asyncio.sleep(5)
+
+# Запускаем фоновую задачу
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(update_drivers_positions())
+
+# Middleware для добавления traceId
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start_time = datetime.now()
+async def add_trace_id(request: Request, call_next):
+    trace_id = request.headers.get('X-Request-Id', str(uuid.uuid4()))
+    request.state.trace_id = trace_id
     
-    trace_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-    
-    logger.info(
-        "Request started",
-        method=request.method,
-        url=str(request.url),
-        trace_id=trace_id
-    )
+    logger.info(f"Request: {request.method} {request.url.path}", extra={'traceId': trace_id})
     
     response = await call_next(request)
-    
-    process_time = (datetime.now() - start_time).total_seconds()
-    
-    logger.info(
-        "Request completed",
-        method=request.method,
-        url=str(request.url),
-        status_code=response.status_code,
-        process_time=process_time,
-        trace_id=trace_id
-    )
-    
+    response.headers['X-Request-Id'] = trace_id
     return response
 
-# Health check
-@app.get("/healthz", response_model=HealthResponse)
+# Health check endpoints
+@app.get("/healthz")
 async def health_check():
-    return HealthResponse(
-        status="healthy",
-        timestamp=datetime.now().isoformat(),
-        service="geo-service"
-    )
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-# Ready check
-@app.get("/readyz", response_model=HealthResponse)
+@app.get("/readyz")
 async def ready_check():
+    """Ready check endpoint"""
     try:
         # Проверяем доступность MapTiler API
-        if MAPTILER_API_KEY:
-            test_url = f"https://api.maptiler.com/geocoding/55.7558,37.6176.json?key={MAPTILER_API_KEY}"
-            response = await http_client.get(test_url)
-            if response.status_code == 200:
-                return HealthResponse(
-                    status="ready",
-                    timestamp=datetime.now().isoformat(),
-                    service="geo-service"
-                )
+        moscow_center_lat = 55.7558
+        moscow_center_lng = 37.6176
         
-        # Если нет API ключа, все равно считаем готовым
-        return HealthResponse(
-            status="ready",
-            timestamp=datetime.now().isoformat(),
-            service="geo-service"
+        test_response = await http_client.get(
+            f"{MAPTILER_BASE_URL}/{moscow_center_lng},{moscow_center_lat};{moscow_center_lng+0.01},{moscow_center_lat+0.01}",
+            params={"key": MAPTILER_API_KEY},
+            timeout=5.0
         )
         
+        maptiler_available = test_response.status_code == 200
+        
+        return {
+            "status": "ready" if maptiler_available else "degraded",
+            "maptiler": "available" if maptiler_available else "unavailable",
+            "drivers": len(fake_drivers)
+        }
     except Exception as e:
-        logger.error("Service not ready", error=str(e))
-        raise HTTPException(status_code=503, detail="Service not ready")
+        logger.error(f"Ready check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "error": str(e)}
+        )
 
-# Получение ETA и расстояния для маршрута
-@app.post("/route/eta", response_model=ApiResponse)
-async def get_route_eta(request: RouteRequest, req: Request):
+# Функция для создания ключа кэша
+def get_cache_key(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: float) -> str:
+    """Создание ключа кэша для маршрута"""
+    return f"{origin_lat:.6f},{origin_lng:.6f}_{dest_lat:.6f},{dest_lng:.6f}"
+
+# Функция для проверки актуальности кэша
+def is_cache_valid(cache_entry: Dict[str, Any]) -> bool:
+    """Проверка актуальности записи в кэше"""
+    cached_time = datetime.fromisoformat(cache_entry["timestamp"])
+    return (datetime.utcnow() - cached_time).total_seconds() < CACHE_TTL
+
+@app.post("/route/eta")
+async def get_route_eta(request: RouteEtaRequest, http_request: Request):
+    """Прокси MapTiler Directions для получения ETA и расстояния"""
+    trace_id = http_request.state.trace_id
+    
     try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        # Создаем ключ кэша
-        cache_key = f"{request.origin}_{request.destination}"
-        
         # Проверяем кэш
-        if cache_key in route_cache:
-            cached_data = route_cache[cache_key]
-            if (datetime.now().timestamp() - cached_data['timestamp']) < CACHE_TTL_SEC:
-                logger.info("Route served from cache", origin=request.origin, destination=request.destination)
-                return ApiResponse(
-                    data=cached_data['data'],
-                    traceId=trace_id
-                )
+        cache_key = get_cache_key(request.originLat, request.originLng, request.destLat, request.destLng)
         
-        # Если нет API ключа MapTiler, используем заглушку
-        if not MAPTILER_API_KEY:
-            # Простая заглушка для Москвы
-            if "красная площадь" in request.origin.lower() and "тверская" in request.destination.lower():
-                route_data = {
-                    'etaSeconds': 300,  # 5 минут
-                    'distanceMeters': 2500.0
+        if cache_key in route_cache and is_cache_valid(route_cache[cache_key]):
+            cached_data = route_cache[cache_key]
+            logger.info(f"Route ETA from cache: {cache_key}", extra={'traceId': trace_id})
+            
+            return {
+                "data": {
+                    "etaSec": cached_data["etaSec"],
+                    "distanceM": cached_data["distanceM"]
+                },
+                "error": None,
+                "traceId": trace_id
+            }
+        
+        # Запрос к MapTiler API
+        coordinates = f"{request.originLng},{request.originLat};{request.destLng},{request.destLat}"
+        
+        response = await http_client.get(
+            f"{MAPTILER_BASE_URL}/{coordinates}",
+            params={
+                "key": MAPTILER_API_KEY,
+                "overview": "false",
+                "steps": "false"
+            },
+            timeout=8.0
+        )
+        
+        if response.status_code == 200:
+            maptiler_data = response.json()
+            
+            if maptiler_data.get("routes"):
+                route = maptiler_data["routes"][0]
+                distance_m = route["distance"]  # в метрах
+                duration_s = route["duration"]  # в секундах
+                
+                # Сохраняем в кэш
+                cache_data = {
+                    "etaSec": int(duration_s),
+                    "distanceM": distance_m,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                route_cache[cache_key] = cache_data
+                
+                logger.info(f"Route ETA calculated: {distance_m}m, {duration_s}s", extra={'traceId': trace_id})
+                
+                return {
+                    "data": {
+                        "etaSec": int(duration_s),
+                        "distanceM": distance_m
+                    },
+                    "error": None,
+                    "traceId": trace_id
                 }
             else:
-                route_data = {
-                    'etaSeconds': 600,  # 10 минут
-                    'distanceMeters': 5000.0
-                }
+                # Fallback к расчету по прямой
+                return _calculate_direct_route(request, trace_id)
         else:
-            # Реальный запрос к MapTiler
-            try:
-                # Геокодируем адреса
-                origin_coords = await geocode_address(request.origin)
-                dest_coords = await geocode_address(request.destination)
-                
-                if not origin_coords or not dest_coords:
-                    raise HTTPException(status_code=400, detail="Failed to geocode addresses")
-                
-                # Получаем маршрут
-                route_data = await get_maptiler_route(origin_coords, dest_coords)
-                
-            except Exception as e:
-                logger.error("MapTiler API failed, using fallback", error=str(e))
-                # Fallback на заглушку
-                route_data = {
-                    'etaSeconds': 600,
-                    'distanceMeters': 5000.0
-                }
-        
-        # Сохраняем в кэш
-        route_cache[cache_key] = {
-            'data': route_data,
-            'timestamp': datetime.now().timestamp()
-        }
-        
-        # Очищаем старые записи кэша
-        cleanup_cache()
-        
-        return ApiResponse(
-            data=route_data,
-            traceId=trace_id
-        )
-        
-    except HTTPException:
-        raise
+            # Fallback к расчету по прямой
+            logger.warning(f"MapTiler API error: {response.status_code}", extra={'traceId': trace_id})
+            return _calculate_direct_route(request, trace_id)
+            
     except Exception as e:
-        logger.error("Failed to get route ETA", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Route ETA calculation failed: {e}", extra={'traceId': trace_id})
+        # Fallback к расчету по прямой
+        return _calculate_direct_route(request, trace_id)
 
-# Получение списка водителей в bounding box
-@app.get("/drivers", response_model=ApiResponse)
-async def get_drivers(bbox: str, req: Request):
+def _calculate_direct_route(request: RouteEtaRequest, trace_id: str) -> Dict[str, Any]:
+    """Fallback расчет маршрута по прямой линии"""
     try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
+        # Расчет расстояния по формуле гаверсинуса
+        lat1, lng1 = math.radians(request.originLat), math.radians(request.originLng)
+        lat2, lng2 = math.radians(request.destLat), math.radians(request.destLng)
         
-        # Парсим bbox (west,south,east,north)
-        try:
-            west, south, east, north = map(float, bbox.split(','))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid bbox format")
+        dlat = lat2 - lat1
+        dlng = lng2 - lng1
         
-        # Фильтруем водителей по bounding box
-        drivers_in_bbox = []
-        for driver in mock_drivers:
-            if (west <= driver['longitude'] <= east and 
-                south <= driver['latitude'] <= north):
-                drivers_in_bbox.append(driver)
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        distance_km = 6371 * c  # Радиус Земли в км
+        distance_m = distance_km * 1000
         
-        logger.info("Drivers in bbox", bbox=bbox, count=len(drivers_in_bbox))
+        # Примерная скорость в городе 30 км/ч
+        duration_s = int((distance_km / 30) * 3600)
         
-        return ApiResponse(
-            data={'drivers': drivers_in_bbox},
-            traceId=trace_id
-        )
+        logger.info(f"Direct route calculated: {distance_m}m, {duration_s}s", extra={'traceId': trace_id})
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to get drivers", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def geocode_address(address: str) -> Optional[Dict[str, float]]:
-    """Геокодирование адреса через MapTiler"""
-    try:
-        url = f"https://api.maptiler.com/geocoding/{address}.json"
-        params = {
-            'key': MAPTILER_API_KEY,
-            'country': 'RU',
-            'language': 'ru'
-        }
-        
-        response = await http_client.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('features'):
-                coords = data['features'][0]['geometry']['coordinates']
-                return {
-                    'longitude': coords[0],
-                    'latitude': coords[1]
-                }
-        
-        return None
-        
-    except Exception as e:
-        logger.error("Geocoding failed", address=address, error=str(e))
-        return None
-
-async def get_maptiler_route(origin: Dict[str, float], destination: Dict[str, float]) -> Dict[str, Any]:
-    """Получение маршрута через MapTiler Directions API"""
-    try:
-        url = "https://api.maptiler.com/directions/v2/route"
-        params = {
-            'key': MAPTILER_API_KEY,
-            'start': f"{origin['longitude']},{origin['latitude']}",
-            'end': f"{destination['longitude']},{destination['latitude']}",
-            'profile': 'driving',
-            'units': 'metric'
-        }
-        
-        response = await http_client.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('routes'):
-                route = data['routes'][0]
-                return {
-                    'etaSeconds': int(route['duration']),
-                    'distanceMeters': route['distance']
-                }
-        
-        # Fallback
         return {
-            'etaSeconds': 600,
-            'distanceMeters': 5000.0
+            "data": {
+                "etaSec": duration_s,
+                "distanceM": distance_m
+            },
+            "error": None,
+            "traceId": trace_id
         }
         
     except Exception as e:
-        logger.error("MapTiler routing failed", error=str(e))
-        return {
-            'etaSeconds': 600,
-            'distanceMeters': 5000.0
-        }
+        logger.error(f"Direct route calculation failed: {e}", extra={'traceId': trace_id})
+        return JSONResponse(
+            status_code=500,
+            content={
+                "data": None,
+                "error": {"code": "ROUTE_CALCULATION_FAILED", "message": str(e)},
+                "traceId": trace_id
+            }
+        )
 
-def cleanup_cache():
-    """Очистка устаревших записей кэша"""
-    global route_cache
+@app.get("/drivers")
+async def get_available_drivers(
+    lat: float,
+    lng: float,
+    radius: float = 5000,
+    http_request: Request = None
+):
+    """Получение доступных водителей в радиусе (заглушка)"""
+    trace_id = getattr(http_request.state, 'trace_id', str(uuid.uuid4())) if http_request else str(uuid.uuid4())
     
-    current_time = datetime.now().timestamp()
-    expired_keys = [
-        key for key, value in route_cache.items()
-        if (current_time - value['timestamp']) > CACHE_TTL_SEC
-    ]
+    try:
+        # Фильтруем водителей по радиусу
+        nearby_drivers = []
+        
+        for driver in fake_drivers:
+            # Расчет расстояния в метрах
+            distance = _calculate_distance(lat, lng, driver["lat"], driver["lng"])
+            
+            if distance <= radius:
+                # Добавляем расстояние и ETA
+                eta_minutes = max(1, int(distance / 500))  # ~30 км/ч средняя скорость
+                
+                driver_info = {
+                    "id": driver["id"],
+                    "name": driver["name"],
+                    "phone": driver["phone"],
+                    "rating": driver["rating"],
+                    "vehicleClass": driver["vehicleClass"],
+                    "vehicleNumber": driver["vehicleNumber"],
+                    "lat": driver["lat"],
+                    "lng": driver["lng"],
+                    "heading": driver["heading"],
+                    "speed": driver["speed"],
+                    "distance": round(distance, 1),
+                    "eta": eta_minutes * 60,  # в секундах
+                    "lastUpdate": driver["lastUpdate"].isoformat()
+                }
+                
+                nearby_drivers.append(driver_info)
+        
+        # Сортируем по расстоянию
+        nearby_drivers.sort(key=lambda d: d["distance"])
+        
+        # Ограничиваем до 10 ближайших
+        nearby_drivers = nearby_drivers[:10]
+        
+        logger.info(f"Found {len(nearby_drivers)} drivers within {radius}m", extra={'traceId': trace_id})
+        
+        return {
+            "data": nearby_drivers,
+            "error": None,
+            "traceId": trace_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get available drivers: {e}", extra={'traceId': trace_id})
+        return JSONResponse(
+            status_code=500,
+            content={
+                "data": None,
+                "error": {"code": "DRIVERS_FETCH_FAILED", "message": str(e)},
+                "traceId": trace_id
+            }
+        )
+
+def _calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Расчет расстояния между двумя точками в метрах"""
+    # Формула гаверсинуса
+    lat1_rad = math.radians(lat1)
+    lng1_rad = math.radians(lng1)
+    lat2_rad = math.radians(lat2)
+    lng2_rad = math.radians(lng2)
     
-    for key in expired_keys:
-        del route_cache[key]
+    dlat = lat2_rad - lat1_rad
+    dlng = lng2_rad - lng1_rad
     
-    if expired_keys:
-        logger.info("Cache cleaned", expired_count=len(expired_keys))
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlng/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    return 6371000 * c  # Радиус Земли в метрах
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8002,
+        reload=True,
+        log_level="info"
+    )

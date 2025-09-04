@@ -1,734 +1,491 @@
 #!/usr/bin/env python3
 """
-MagaDrive API Gateway
-Единственная публичная точка для всех API запросов
+MagaDrive API Gateway - T8-T10
+REST маршруты и WebSocket ретранслятор для микросервисов
 """
 
+import asyncio
+import json
+import logging
 import os
 import uuid
-import time
-import json
-from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Dict, Any, Optional
 
-import httpx
-import structlog
-from fastapi import FastAPI, Request, Response, HTTPException, Depends, WebSocket, WebSocketDisconnect
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import httpx
 from pydantic import BaseModel
 
 # Настройка логирования
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s", "traceId": "%(traceId)s"}',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-logger = structlog.get_logger()
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        record.traceId = getattr(record, 'traceId', 'unknown')
+        return super().format(record)
 
-# Модели данных
-class CreateRideRequest(BaseModel):
-    origin: str
-    destination: str
-    vehicleClass: str
-    userId: str
-
-class CancelRideRequest(BaseModel):
-    reason: Optional[str] = None
-
-class RouteRequest(BaseModel):
-    origin: str
-    destination: str
-
-class PricingRequest(BaseModel):
-    distanceM: float
-    etaSec: int
-    class_type: str
-
-class ApiResponse(BaseModel):
-    data: Optional[Dict[str, Any]] = None
-    error: Optional[Dict[str, Any]] = None
-    traceId: str
-
-class HealthResponse(BaseModel):
-    status: str
-    timestamp: str
-    service: str
+logger = logging.getLogger(__name__)
+logger.handlers[0].setFormatter(CustomFormatter())
 
 # Конфигурация
-ENV = os.getenv("ENV", "dev")
-RIDES_URL = os.getenv("RIDES_URL", "http://ride:7031")
-GEO_URL = os.getenv("GEO_URL", "http://geo:7032")
-PRICING_URL = os.getenv("PRICING_URL", "http://pricing:7010")
+API_BASE_URL = os.getenv('API_BASE_URL', 'http://localhost:8080')
+RIDE_SERVICE_URL = os.getenv('RIDE_SERVICE_URL', 'http://ride-service:8001')
+GEO_SERVICE_URL = os.getenv('GEO_SERVICE_URL', 'http://geo-service:8002')
+PRICING_SERVICE_URL = os.getenv('PRICING_SERVICE_URL', 'http://pricing-service:8003')
 
 # HTTP клиент
 http_client = httpx.AsyncClient(timeout=10.0)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Управление жизненным циклом приложения"""
-    logger.info("Starting API Gateway", env=ENV)
-    yield
-    logger.info("Shutting down API Gateway")
-    await http_client.aclose()
+# WebSocket соединения
+active_connections: Dict[str, WebSocket] = {}
 
-# Создание FastAPI приложения
 app = FastAPI(
     title="MagaDrive API Gateway",
-    description="Единая точка входа для всех API запросов",
-    version="1.0.0",
-    lifespan=lifespan
+    description="API Gateway для микросервисов T8-T10",
+    version="1.0.0"
 )
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене ограничить
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Middleware для логирования и trace-id
+# Модели данных
+class RideCreateRequest(BaseModel):
+    origin: str
+    destination: str
+    vehicleClass: str
+    userId: Optional[str] = None
+    originLat: Optional[float] = None
+    originLng: Optional[float] = None
+    destLat: Optional[float] = None
+    destLng: Optional[float] = None
+
+class RideCancelRequest(BaseModel):
+    reason: Optional[str] = None
+
+class RouteEtaRequest(BaseModel):
+    originLat: float
+    originLng: float
+    destLat: float
+    destLng: float
+
+class DriversRequest(BaseModel):
+    lat: float
+    lng: float
+    radius: Optional[float] = 5000
+
+# Middleware для добавления traceId
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Middleware для логирования запросов и добавления trace-id"""
-    start_time = time.time()
-    
-    # Генерируем trace-id если его нет
-    trace_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-    
-    # Логируем начало запроса
-    logger.info(
-        "Request started",
-        method=request.method,
-        url=str(request.url),
-        trace_id=trace_id,
-        user_agent=request.headers.get("user-agent"),
-        client_ip=request.client.host if request.client else None
-    )
-    
-    # Добавляем trace-id в заголовки
+async def add_trace_id(request: Request, call_next):
+    trace_id = request.headers.get('X-Request-Id', str(uuid.uuid4()))
     request.state.trace_id = trace_id
     
-    # Обрабатываем запрос
+    # Добавляем traceId в логи
+    logger.info(f"Request: {request.method} {request.url.path}", extra={'traceId': trace_id})
+    
     response = await call_next(request)
-    
-    # Вычисляем время выполнения
-    process_time = time.time() - start_time
-    
-    # Добавляем trace-id в ответ
-    response.headers["X-Request-Id"] = trace_id
-    
-    # Логируем завершение запроса
-    logger.info(
-        "Request completed",
-        method=request.method,
-        url=str(request.url),
-        status_code=response.status_code,
-        trace_id=trace_id,
-        duration_ms=round(process_time * 1000, 2)
-    )
-    
+    response.headers['X-Request-Id'] = trace_id
     return response
 
-# Health checks
-@app.get("/healthz", response_model=HealthResponse)
+# Health check endpoints
+@app.get("/healthz")
 async def health_check():
-    """Liveness probe"""
-    return HealthResponse(
-        status="healthy",
-        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        service="api-gateway"
-    )
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-# API маршруты
-@app.post("/rides", response_model=ApiResponse)
-async def create_ride(request: CreateRideRequest, req: Request):
+@app.get("/readyz")
+async def ready_check():
+    """Ready check endpoint"""
+    try:
+        # Проверяем доступность основных сервисов
+        services_status = {}
+        
+        # Ride service
+        try:
+            response = await http_client.get(f"{RIDE_SERVICE_URL}/healthz")
+            services_status["ride_service"] = response.status_code == 200
+        except:
+            services_status["ride_service"] = False
+        
+        # Geo service
+        try:
+            response = await http_client.get(f"{GEO_SERVICE_URL}/healthz")
+            services_status["geo_service"] = response.status_code == 200
+        except:
+            services_status["geo_service"] = False
+        
+        # Pricing service
+        try:
+            response = await http_client.get(f"{PRICING_SERVICE_URL}/healthz")
+            services_status["pricing_service"] = response.status_code == 200
+        except:
+            services_status["pricing_service"] = False
+        
+        all_ready = all(services_status.values())
+        
+        if all_ready:
+            return {"status": "ready", "services": services_status}
+        else:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready", "services": services_status}
+            )
+            
+    except Exception as e:
+        logger.error(f"Ready check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": str(e)}
+        )
+
+# REST API маршруты
+@app.post("/v1/rides")
+async def create_ride(request: RideCreateRequest, http_request: Request):
     """Создание новой поездки"""
-    try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        # Проксируем запрос в ride service
-        ride_response = await http_client.post(
-            f"{RIDES_URL}/rides",
-            json={
-                "origin": request.origin,
-                "destination": request.destination,
-                "vehicleClass": request.vehicleClass,
-                "userId": request.userId
-            },
-            headers={"X-Request-Id": trace_id}
-        )
-        
-        if ride_response.status_code == 200:
-            return ApiResponse(
-                data=ride_response.json(),
-                traceId=trace_id
-            )
-        else:
-            return ApiResponse(
-                error={
-                    "code": "RIDE_CREATION_FAILED",
-                    "message": "Failed to create ride",
-                    "statusCode": ride_response.status_code
-                },
-                traceId=trace_id
-            )
-            
-    except Exception as e:
-        logger.error("Create ride failed", error=str(e))
-        return ApiResponse(
-            error={
-                "code": "INTERNAL_ERROR",
-                "message": str(e)
-            },
-            traceId=trace_id
-        )
-
-@app.get("/rides/{ride_id}", response_model=ApiResponse)
-async def get_ride(ride_id: str, req: Request):
-    """Получение информации о поездке"""
-    try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        ride_response = await http_client.get(
-            f"{RIDES_URL}/rides/{ride_id}",
-            headers={"X-Request-Id": trace_id}
-        )
-        
-        if ride_response.status_code == 200:
-            return ApiResponse(
-                data=ride_response.json(),
-                traceId=trace_id
-            )
-        else:
-            return ApiResponse(
-                error={
-                    "code": "RIDE_NOT_FOUND",
-                    "message": "Ride not found",
-                    "statusCode": ride_response.status_code
-                },
-                traceId=trace_id
-            )
-            
-    except Exception as e:
-        logger.error("Get ride failed", error=str(e))
-        return ApiResponse(
-            error={
-                "code": "INTERNAL_ERROR",
-                "message": str(e)
-            },
-            traceId=trace_id
-        )
-
-@app.post("/rides/{ride_id}/cancel", response_model=ApiResponse)
-async def cancel_ride(ride_id: str, request: CancelRideRequest, req: Request):
-    """Отмена поездки"""
-    try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        cancel_response = await http_client.post(
-            f"{RIDES_URL}/rides/{ride_id}/cancel",
-            json={"reason": request.reason},
-            headers={"X-Request-Id": trace_id}
-        )
-        
-        if cancel_response.status_code == 200:
-            return ApiResponse(
-                data=cancel_response.json(),
-                traceId=trace_id
-            )
-        else:
-            return ApiResponse(
-                error={
-                    "code": "RIDE_CANCEL_FAILED",
-                    "message": "Failed to cancel ride",
-                    "statusCode": cancel_response.status_code
-                },
-                traceId=trace_id
-            )
-            
-    except Exception as e:
-        logger.error("Cancel ride failed", error=str(e))
-        return ApiResponse(
-            error={
-                "code": "INTERNAL_ERROR",
-                "message": str(e)
-            },
-            traceId=trace_id
-        )
-
-@app.post("/route/eta", response_model=ApiResponse)
-async def get_route_eta(request: RouteRequest, req: Request):
-    """Получение ETA и расстояния для маршрута"""
-    try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        geo_response = await http_client.post(
-            f"{GEO_URL}/route/eta",
-            json={
-                "origin": request.origin,
-                "destination": request.destination
-            },
-            headers={"X-Request-Id": trace_id}
-        )
-        
-        if geo_response.status_code == 200:
-            return ApiResponse(
-                data=geo_response.json(),
-                traceId=trace_id
-            )
-        else:
-            return ApiResponse(
-                error={
-                    "code": "ROUTE_CALCULATION_FAILED",
-                    "message": "Failed to calculate route",
-                    "statusCode": geo_response.status_code
-                },
-                traceId=trace_id
-            )
-            
-    except Exception as e:
-        logger.error("Route ETA failed", error=str(e))
-        return ApiResponse(
-            error={
-                "code": "INTERNAL_ERROR",
-                "message": str(e)
-            },
-            traceId=trace_id
-        )
-
-@app.get("/drivers")
-async def get_drivers(bbox: str, req: Request):
-    """Получение списка водителей в bounding box"""
-    try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        drivers_response = await http_client.get(
-            f"{GEO_URL}/drivers?bbox={bbox}",
-            headers={"X-Request-Id": trace_id}
-        )
-        
-        if drivers_response.status_code == 200:
-            return ApiResponse(
-                data=drivers_response.json(),
-                traceId=trace_id
-            )
-        else:
-            return ApiResponse(
-                error={
-                    "code": "DRIVERS_FETCH_FAILED",
-                    "message": "Failed to fetch drivers",
-                    "statusCode": drivers_response.status_code
-                },
-                traceId=trace_id
-            )
-            
-    except Exception as e:
-        logger.error("Get drivers failed", error=str(e))
-        return ApiResponse(
-            error={
-                "code": "INTERNAL_ERROR",
-                "message": str(e)
-            },
-            traceId=trace_id
-        )
-
-@app.post("/price", response_model=ApiResponse)
-async def calculate_price(request: PricingRequest, req: Request):
-    """Расчет цены поездки"""
-    try:
-        trace_id = req.headers.get("X-Request-Id") or str(uuid.uuid4())
-        
-        pricing_response = await http_client.post(
-            f"{PRICING_URL}/price",
-            json={
-                "distanceM": request.distanceM,
-                "etaSec": request.etaSec,
-                "class": request.class_type
-            },
-            headers={"X-Request-Id": trace_id}
-        )
-        
-        if pricing_response.status_code == 200:
-            return ApiResponse(
-                data=pricing_response.json(),
-                traceId=trace_id
-            )
-        else:
-            return ApiResponse(
-                error={
-                    "code": "PRICING_CALCULATION_FAILED",
-                    "message": "Failed to calculate price",
-                    "statusCode": pricing_response.status_code
-                },
-                traceId=trace_id
-            )
-            
-    except Exception as e:
-        logger.error("Price calculation failed", error=str(e))
-        return ApiResponse(
-            error={
-                "code": "INTERNAL_ERROR",
-                "message": str(e)
-            },
-            traceId=trace_id
-        )
-
-# WebSocket endpoint для ретрансляции событий
-@app.websocket("/ws/ride/{ride_id}")
-async def websocket_ride_events(websocket: WebSocket, ride_id: str):
-    """WebSocket для получения событий поездки в реальном времени"""
-    await websocket.accept()
+    trace_id = http_request.state.trace_id
     
     try:
-        # Подключаемся к ride service WebSocket
-        async with httpx.AsyncClient() as client:
-            ride_ws_url = f"{RIDES_URL.replace('http', 'ws')}/ws/ride/{ride_id}"
-            
-            # Проксируем события от ride service к клиенту
-            async with client.websocket_connect(ride_ws_url) as ride_ws:
-                # Запускаем два потока: один читает от ride service, другой от клиента
-                import asyncio
-                
-                async def forward_from_ride():
-                    try:
-                        async for message in ride_ws.iter_text():
-                            await websocket.send_text(message)
-                    except Exception as e:
-                        logger.error("Error forwarding from ride service", error=str(e))
-                
-                async def forward_to_ride():
-                    try:
-                        async for message in websocket.iter_text():
-                            # Клиент может отправлять команды в ride service
-                            await ride_ws.send_text(message)
-                    except Exception as e:
-                        logger.error("Error forwarding to ride service", error=str(e))
-                
-                # Запускаем оба потока
-                await asyncio.gather(
-                    forward_from_ride(),
-                    forward_to_ride(),
-                    return_exceptions=True
-                )
-                
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected", ride_id=ride_id)
-    except Exception as e:
-        logger.error("WebSocket error", error=str(e), ride_id=ride_id)
-        try:
-            await websocket.close(code=1011, reason="Internal error")
-        except:
-            pass
-
-@app.get("/readyz", response_model=HealthResponse)
-async def readiness_check():
-    """Readiness probe"""
-    # Проверяем доступность зависимых сервисов
-    try:
-        # Проверяем ride service
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            ride_response = await client.get(f"{RIDES_URL}/healthz")
-            if ride_response.status_code != 200:
-                raise HTTPException(status_code=503, detail="Ride service not ready")
+        # Проксируем запрос в ride service
+        headers = {
+            'X-Request-Id': trace_id,
+            'Content-Type': 'application/json'
+        }
         
-        # Проверяем geo service
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            geo_response = await client.get(f"{GEO_URL}/healthz")
-            if geo_response.status_code != 200:
-                raise HTTPException(status_code=503, detail="Geo service not ready")
+        # Добавляем Idempotency-Key если есть
+        idempotency_key = http_request.headers.get('Idempotency-Key')
+        if idempotency_key:
+            headers['Idempotency-Key'] = idempotency_key
         
-        # Проверяем pricing service
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            pricing_response = await client.get(f"{PRICING_URL}/healthz")
-            if pricing_response.status_code != 200:
-                raise HTTPException(status_code=503, detail="Pricing service not ready")
-        
-        return HealthResponse(
-            status="ready",
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            service="api-gateway"
+        response = await http_client.post(
+            f"{RIDE_SERVICE_URL}/rides",
+            json=request.dict(),
+            headers=headers
         )
-    except Exception as e:
-        logger.error("Readiness check failed", error=str(e))
-        raise HTTPException(status_code=503, detail="Service not ready")
-
-# API v1 роуты
-@app.get("/v1/health", response_model=ApiResponse)
-async def api_health():
-    """API health check"""
-    return ApiResponse(
-        data={"status": "healthy", "service": "api-gateway"},
-        error=None,
-        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-    )
-
-# Проксирование к ride service
-@app.post("/v1/rides")
-async def create_ride(request: Request):
-    """Создание новой поездки"""
-    try:
-        # Получаем тело запроса
-        body = await request.json()
         
-        # Проверяем обязательные заголовки
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if not idempotency_key:
-            raise HTTPException(status_code=400, detail="Idempotency-Key header required")
-        
-        # Проксируем запрос к ride service
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{RIDES_URL}/rides",
-                json=body,
-                headers={"Idempotency-Key": idempotency_key}
+        if response.status_code == 200:
+            ride_data = response.json()
+            logger.info(f"Ride created: {ride_data.get('id', 'unknown')}", extra={'traceId': trace_id})
+            
+            return {
+                "data": ride_data,
+                "error": None,
+                "traceId": trace_id
+            }
+        else:
+            error_data = response.json() if response.content else {"message": "Unknown error"}
+            logger.error(f"Failed to create ride: {error_data}", extra={'traceId': trace_id})
+            
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "data": None,
+                    "error": error_data,
+                    "traceId": trace_id
+                }
             )
             
-            if response.status_code == 200:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=response.json(),
-                        error=None,
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=200,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Ride service error")
-                
     except Exception as e:
-        logger.error("Create ride failed", error=str(e))
+        logger.error(f"Create ride error: {e}", extra={'traceId': trace_id})
         return JSONResponse(
-            content=ApiResponse(
-                data=None,
-                error={"code": "INTERNAL_ERROR", "message": str(e)},
-                traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-            ).dict(),
             status_code=500,
-            headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
+            content={
+                "data": None,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+                "traceId": trace_id
+            }
         )
 
 @app.get("/v1/rides/{ride_id}")
-async def get_ride(ride_id: str, request: Request):
+async def get_ride(ride_id: str, http_request: Request):
     """Получение информации о поездке"""
+    trace_id = http_request.state.trace_id
+    
     try:
-        # Проксируем запрос к ride service
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{RIDES_URL}/rides/{ride_id}")
-            
-            if response.status_code == 200:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=response.json(),
-                        error=None,
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=200,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            elif response.status_code == 404:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=None,
-                        error={"code": "RIDE_NOT_FOUND", "message": "Поездка не найдена"},
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=404,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Ride service error")
-                
-    except Exception as e:
-        logger.error("Get ride failed", error=str(e))
-        return JSONResponse(
-            content=ApiResponse(
-                data=None,
-                error={"code": "INTERNAL_ERROR", "message": str(e)},
-                traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-            ).dict(),
-            status_code=500,
-            headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
+        response = await http_client.get(
+            f"{RIDE_SERVICE_URL}/rides/{ride_id}",
+            headers={'X-Request-Id': trace_id}
         )
-
-# Проксирование к geo service
-@app.get("/v1/drivers")
-async def get_drivers(bbox: str, request: Request):
-    """Поиск водителей в bounding box"""
-    try:
-        # Проксируем запрос к geo service
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{GEO_URL}/drivers?bbox={bbox}")
+        
+        if response.status_code == 200:
+            ride_data = response.json()
+            return {
+                "data": ride_data,
+                "error": None,
+                "traceId": trace_id
+            }
+        else:
+            error_data = response.json() if response.content else {"message": "Ride not found"}
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "data": None,
+                    "error": error_data,
+                    "traceId": trace_id
+                }
+            )
             
-            if response.status_code == 200:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=response.json(),
-                        error=None,
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=200,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Geo service error")
-                
     except Exception as e:
-        logger.error("Get drivers failed", error=str(e))
+        logger.error(f"Get ride error: {e}", extra={'traceId': trace_id})
         return JSONResponse(
-            content=ApiResponse(
-                data=None,
-                error={"code": "INTERNAL_ERROR", "message": str(e)},
-                traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-            ).dict(),
             status_code=500,
-            headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
+            content={
+                "data": None,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+                "traceId": trace_id
+            }
         )
 
 @app.post("/v1/rides/{ride_id}/cancel")
-async def cancel_ride(ride_id: str, request: Request):
+async def cancel_ride(ride_id: str, request: RideCancelRequest, http_request: Request):
     """Отмена поездки"""
+    trace_id = http_request.state.trace_id
+    
     try:
-        # Проксируем запрос к ride service
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(f"{RIDES_URL}/rides/{ride_id}/cancel")
+        headers = {
+            'X-Request-Id': trace_id,
+            'Content-Type': 'application/json'
+        }
+        
+        # Добавляем Idempotency-Key если есть
+        idempotency_key = http_request.headers.get('Idempotency-Key')
+        if idempotency_key:
+            headers['Idempotency-Key'] = idempotency_key
+        
+        response = await http_client.post(
+            f"{RIDE_SERVICE_URL}/rides/{ride_id}/cancel",
+            json=request.dict(),
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Ride {ride_id} canceled", extra={'traceId': trace_id})
+            return {
+                "data": {"status": "canceled"},
+                "error": None,
+                "traceId": trace_id
+            }
+        else:
+            error_data = response.json() if response.content else {"message": "Failed to cancel ride"}
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "data": None,
+                    "error": error_data,
+                    "traceId": trace_id
+                }
+            )
             
-            if response.status_code == 200:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=response.json(),
-                        error=None,
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=200,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            elif response.status_code == 404:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=None,
-                        error={"code": "RIDE_NOT_FOUND", "message": "Поездка не найдена"},
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=404,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Ride service error")
-                
     except Exception as e:
-        logger.error("Cancel ride failed", error=str(e))
+        logger.error(f"Cancel ride error: {e}", extra={'traceId': trace_id})
         return JSONResponse(
-            content=ApiResponse(
-                data=None,
-                error={"code": "INTERNAL_ERROR", "message": str(e)},
-                traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-            ).dict(),
             status_code=500,
-            headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
+            content={
+                "data": None,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+                "traceId": trace_id
+            }
         )
 
 @app.post("/v1/route/eta")
-async def calculate_route_eta(request: Request):
-    """Расчет маршрута и ETA"""
+async def get_route_eta(request: RouteEtaRequest, http_request: Request):
+    """Получение ETA и расстояния маршрута"""
+    trace_id = http_request.state.trace_id
+    
     try:
-        # Получаем тело запроса
-        body = await request.json()
+        response = await http_client.post(
+            f"{GEO_SERVICE_URL}/route/eta",
+            json=request.dict(),
+            headers={'X-Request-Id': trace_id}
+        )
         
-        # Проксируем запрос к geo service
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(f"{GEO_URL}/route/eta", json=body)
+        if response.status_code == 200:
+            route_data = response.json()
+            return {
+                "data": route_data,
+                "error": None,
+                "traceId": trace_id
+            }
+        else:
+            error_data = response.json() if response.content else {"message": "Failed to get route ETA"}
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "data": None,
+                    "error": error_data,
+                    "traceId": trace_id
+                }
+            )
             
-            if response.status_code == 200:
-                return JSONResponse(
-                    content=ApiResponse(
-                        data=response.json(),
-                        error=None,
-                        traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-                    ).dict(),
-                    status_code=200,
-                    headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
-                )
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Geo service error")
-                
     except Exception as e:
-        logger.error("Calculate route ETA failed", error=str(e))
+        logger.error(f"Get route ETA error: {e}", extra={'traceId': trace_id})
         return JSONResponse(
-            content=ApiResponse(
-                data=None,
-                error={"code": "INTERNAL_ERROR", "message": str(e)},
-                traceId=getattr(request.state, "trace_id", str(uuid.uuid4()))
-            ).dict(),
             status_code=500,
-            headers={"X-Request-Id": getattr(request.state, "trace_id", str(uuid.uuid4()))}
+            content={
+                "data": None,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+                "traceId": trace_id
+            }
         )
 
-# WebSocket для событий поездки
+@app.get("/v1/drivers")
+async def get_available_drivers(
+    lat: float,
+    lng: float,
+    radius: float = 5000,
+    http_request: Request = None
+):
+    """Получение доступных водителей в радиусе"""
+    trace_id = getattr(http_request.state, 'trace_id', str(uuid.uuid4())) if http_request else str(uuid.uuid4())
+    
+    try:
+        response = await http_client.get(
+            f"{GEO_SERVICE_URL}/drivers",
+            params={"lat": lat, "lng": lng, "radius": radius},
+            headers={'X-Request-Id': trace_id}
+        )
+        
+        if response.status_code == 200:
+            drivers_data = response.json()
+            return {
+                "data": drivers_data,
+                "error": None,
+                "traceId": trace_id
+            }
+        else:
+            error_data = response.json() if response.content else {"message": "Failed to get drivers"}
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "data": None,
+                    "error": error_data,
+                    "traceId": trace_id
+                }
+            )
+            
+    except Exception as e:
+        logger.error(f"Get drivers error: {e}", extra={'traceId': trace_id})
+        return JSONResponse(
+            status_code=500,
+            content={
+                "data": None,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+                "traceId": trace_id
+            }
+        )
+
+# WebSocket endpoint для событий поездки
 @app.websocket("/ws/ride/{ride_id}")
 async def websocket_ride_events(websocket: WebSocket, ride_id: str):
     """WebSocket для получения событий поездки в реальном времени"""
     await websocket.accept()
-    logger.info("WebSocket connection established", ride_id=ride_id, trace_id=str(uuid.uuid4()))
+    
+    connection_id = str(uuid.uuid4())
+    active_connections[connection_id] = websocket
+    
+    logger.info(f"WebSocket connected for ride {ride_id}", extra={'traceId': connection_id})
     
     try:
-        # В T8-T10 просто ретранслируем события от ride service
-        # В будущем здесь будет полноценная подписка на события
-        
-        # Отправляем приветственное сообщение
-        await websocket.send_text(json.dumps({
-            "type": "event",
-            "ts": time.time(),
-            "payload": {
-                "eventType": "CONNECTED",
-                "data": {
-                    "rideId": ride_id,
-                    "message": "WebSocket подключен"
-                }
-            }
-        }))
-        
-        # Держим соединение открытым
-        while True:
-            try:
-                # Проверяем соединение каждые 30 секунд
-                await websocket.receive_text()
-            except WebSocketDisconnect:
-                logger.info("WebSocket disconnected", ride_id=ride_id)
-                break
-            except Exception as e:
-                logger.error("WebSocket error", ride_id=ride_id, error=str(e))
-                break
-                
+        # Подписываемся на события ride service
+        async with httpx.AsyncClient() as client:
+            # Отправляем событие подключения
+            await websocket.send_text(json.dumps({
+                "type": "CONNECTED",
+                "data": {"rideId": ride_id, "message": "Connected to ride events"},
+                "eventId": str(uuid.uuid4()),
+                "timestamp": datetime.utcnow().isoformat()
+            }))
+            
+            # Основной цикл WebSocket
+            while True:
+                try:
+                    # Проверяем соединение
+                    await websocket.receive_text()
+                    
+                    # В T8-T10 просто держим соединение открытым
+                    # События будут приходить от ride service через HTTP
+                    
+                except WebSocketDisconnect:
+                    logger.info(f"WebSocket disconnected for ride {ride_id}", extra={'traceId': connection_id})
+                    break
+                    
     except Exception as e:
-        logger.error("WebSocket connection error", ride_id=ride_id, error=str(e))
+        logger.error(f"WebSocket error for ride {ride_id}: {e}", extra={'traceId': connection_id})
     finally:
+        # Очищаем соединение
+        if connection_id in active_connections:
+            del active_connections[connection_id]
+        await websocket.close()
+
+# Функция для отправки событий всем подключенным клиентам
+async def broadcast_ride_event(ride_id: str, event_data: Dict[str, Any]):
+    """Отправка события всем подключенным WebSocket клиентам"""
+    event_message = {
+        "type": event_data.get("type", "UNKNOWN"),
+        "data": event_data.get("data", {}),
+        "eventId": event_data.get("eventId", str(uuid.uuid4())),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    # Находим все соединения для данной поездки
+    connections_to_remove = []
+    
+    for conn_id, websocket in active_connections.items():
         try:
-            await websocket.close()
-        except:
-            pass
+            await websocket.send_text(json.dumps(event_message))
+        except Exception as e:
+            logger.error(f"Failed to send event to connection {conn_id}: {e}")
+            connections_to_remove.append(conn_id)
+    
+    # Удаляем неработающие соединения
+    for conn_id in connections_to_remove:
+        if conn_id in active_connections:
+            del active_connections[conn_id]
+
+# Endpoint для получения событий от ride service
+@app.post("/internal/ride-events")
+async def receive_ride_event(event_data: Dict[str, Any], http_request: Request):
+    """Внутренний endpoint для получения событий от ride service"""
+    trace_id = http_request.state.trace_id
+    ride_id = event_data.get("data", {}).get("rideId")
+    
+    if not ride_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing rideId in event data"}
+        )
+    
+    try:
+        # Отправляем событие всем подключенным WebSocket клиентам
+        await broadcast_ride_event(ride_id, event_data)
+        
+        logger.info(f"Ride event broadcasted: {event_data.get('type')} for ride {ride_id}", extra={'traceId': trace_id})
+        
+        return {"status": "event_sent"}
+        
+    except Exception as e:
+        logger.error(f"Failed to broadcast ride event: {e}", extra={'traceId': trace_id})
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8080,
-        reload=ENV == "dev"
+        port=8000,
+        reload=True,
+        log_level="info"
     )

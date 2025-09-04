@@ -1,27 +1,34 @@
 FROM python:3.11-slim
 
-WORKDIR /app
-
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Копирование requirements и установка Python зависимостей
+# Рабочая директория
+WORKDIR /app
+
+# Копируем requirements.txt и устанавливаем зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование кода приложения
+# Копируем исходный код
 COPY . .
 
-# Создание пользователя для безопасности
+# Создаем пользователя для безопасности
 RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
 USER app
 
+# Переменные окружения
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Порт
+EXPOSE 8000
+
 # Health check
-HEALTHCHECK --interval=10s --timeout=2s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8080/healthz || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
 
-EXPOSE 8080
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Команда запуска
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
