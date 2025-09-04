@@ -13,11 +13,6 @@ help: ## Показать справку
 
 generate-style: ## Сгенерировать стиль карты с API ключом
 	@echo "🎨 Генерация стиля карты..."
-	@if [ -z "$(MAPTILER_API_KEY)" ]; then \
-		echo "❌ Ошибка: MAPTILER_API_KEY не установлен"; \
-		echo "Установите переменную окружения: export MAPTILER_API_KEY='ваш_ключ'"; \
-		exit 1; \
-	fi
 	powershell -ExecutionPolicy Bypass -File $(SCRIPT_DIR)/generate_map_style.ps1
 	@echo "✅ Стиль карты сгенерирован: $(STYLE_FILE)"
 
