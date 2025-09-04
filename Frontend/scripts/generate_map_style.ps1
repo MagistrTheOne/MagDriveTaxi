@@ -6,7 +6,7 @@ param(
 )
 
 if (-not $ApiKey) {
-    Write-Error "❌ MAPTILER_API_KEY не установлен"
+    Write-Error "MAPTILER_API_KEY не установлен"
     Write-Host "Установите переменную окружения: `$env:MAPTILER_API_KEY='ваш_ключ'"
     exit 1
 }
@@ -18,7 +18,7 @@ try {
     
     # Проверяем существование шаблона
     if (-not (Test-Path $templatePath)) {
-        Write-Error "❌ Шаблон $templatePath не найден"
+        Write-Error "Шаблон $templatePath не найден"
         exit 1
     }
     
@@ -31,10 +31,10 @@ try {
     # Записываем сгенерированный файл
     $generatedContent | Out-File -FilePath $outputPath -Encoding UTF8
     
-    Write-Host "✅ Стиль карты сгенерирован: $outputPath"
-    Write-Host "🔑 Использован API ключ: $($ApiKey.Substring(0, 8))..."
+    Write-Host "Стиль карты сгенерирован: $outputPath"
+    Write-Host "Использован API ключ: $($ApiKey.Substring(0, 8))..."
     
 } catch {
-    Write-Error "❌ Ошибка генерации стиля карты: $_"
+    Write-Error "Ошибка генерации стиля карты: $_"
     exit 1
 }

@@ -1,34 +1,42 @@
 ﻿{
-    "version":  8,
-    "sources":  {
-                    "maptiler":  {
-                                     "url":  "https://api.maptiler.com/maps/streets/{z}/{x}/{y}.png?key=SjhYKAeXJxWy3pPcQc2G",
-                                     "tileSize":  256,
-                                     "type":  "raster",
-                                     "attribution":  "В© MapTiler В© OpenStreetMap contributors"
-                                 }
-                },
-    "glyphs":  "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf?key=SjhYKAeXJxWy3pPcQc2G",
-    "layers":  [
-                   {
-                       "id":  "background",
-                       "type":  "background",
-                       "paint":  {
-                                     "background-color":  "#0B0B0E"
-                                 }
-                   },
-                   {
-                       "source":  "maptiler",
-                       "id":  "maptiler",
-                       "type":  "raster",
-                       "paint":  {
-                                     "raster-brightness-max":  0.8,
-                                     "raster-opacity":  0.7,
-                                     "raster-brightness-min":  0.1,
-                                     "raster-saturation":  -0.3
-                                 }
-                   }
-               ],
-    "sprite":  "https://api.maptiler.com/maps/streets/sprite?key=SjhYKAeXJxWy3pPcQc2G",
-    "name":  "MagaDrive Dark Gold"
+  "version": 8,
+  "name": "MagaDrive Dark Gold",
+  "sprite": "https://api.maptiler.com/maps/streets/sprite",
+  "glyphs": "https://api.maptiler.com/fonts/{fontstack}/{range}.pbf",
+  "sources": {
+    "maptiler": {
+      "type": "raster",
+      "tiles": [
+        "https://api.maptiler.com/maps/streets/{z}/{x}/{y}.png?key=SjhYKAeXJxWy3pPcQc2G"
+      ],
+      "tileSize": 256,
+      "attribution": "© MapTiler © OpenStreetMap contributors"
+    }
+  },
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#0B0B0E"
+      }
+    },
+    {
+      "id": "maptiler-raster",
+      "type": "raster",
+      "source": "maptiler",
+      "paint": {
+        "raster-opacity": 0.8,
+        "raster-saturation": -0.3,
+        "raster-contrast": 0.2,
+        "raster-brightness-min": 0.1
+      }
+    }
+  ],
+  "metadata": {
+    "maptiler:copyright": "© MapTiler © OpenStreetMap contributors",
+    "maptiler:version": "1.0.0",
+    "maptiler:style": "dark_gold"
+  }
 }
+

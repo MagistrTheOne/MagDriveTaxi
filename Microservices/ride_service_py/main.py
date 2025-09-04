@@ -33,7 +33,8 @@ class CustomFormatter(logging.Formatter):
         return super().format(record)
 
 logger = logging.getLogger(__name__)
-logger.handlers[0].setFormatter(CustomFormatter())
+if logger.handlers:
+    logger.handlers[0].setFormatter(CustomFormatter())
 
 # Конфигурация
 DB_PATH = os.getenv('DB_PATH', 'ride_service.db')

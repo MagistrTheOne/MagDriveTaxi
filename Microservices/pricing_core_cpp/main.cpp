@@ -45,7 +45,7 @@ struct PriceRequest {
         try {
             distanceM = j.at("distanceM").get<double>();
             etaSec = j.at("etaSec").get<double>();
-            vehicleClass = j.value("class", "economy");
+            vehicleClass = j.value("class", std::string("economy"));
             return true;
         } catch (const exception& e) {
             cerr << "Error parsing PriceRequest: " << e.what() << endl;
@@ -91,33 +91,29 @@ public:
             // Логируем расчет
             logPriceCalculation(request, price, classMultiplier, demandCoeff, traceId);
             
-            return {
-                {"data", {
-                    {"price", price},
-                    {"currency", "RUB"},
-                    {"breakdown", {
-                        {"base", config.base_price},
-                        {"distance", round(distanceKm * config.price_per_km)},
-                        {"time", round(etaMinutes * config.price_per_minute)},
-                        {"classMultiplier", classMultiplier},
-                        {"demandCoeff", round(demandCoeff * 100) / 100.0}
-                    }}
-                }},
-                {"error", nullptr},
-                {"traceId", traceId}
-            };
+            json response;
+            response["data"]["price"] = price;
+            response["data"]["currency"] = "RUB";
+            response["data"]["breakdown"]["base"] = config.base_price;
+            response["data"]["breakdown"]["distance"] = round(distanceKm * config.price_per_km);
+            response["data"]["breakdown"]["time"] = round(etaMinutes * config.price_per_minute);
+            response["data"]["breakdown"]["classMultiplier"] = classMultiplier;
+            response["data"]["breakdown"]["demandCoeff"] = round(demandCoeff * 100) / 100.0;
+            response["error"] = nullptr;
+            response["traceId"] = traceId;
+            
+            return response;
             
         } catch (const exception& e) {
             cerr << "[ERROR] Price calculation failed: " << e.what() << " (traceId: " << traceId << ")" << endl;
             
-            return {
-                {"data", nullptr},
-                {"error", {
-                    {"code", "PRICE_CALCULATION_FAILED"},
-                    {"message", e.what()}
-                }},
-                {"traceId", traceId}
-            };
+            json errorResponse;
+            errorResponse["data"] = nullptr;
+            errorResponse["error"]["code"] = "PRICE_CALCULATION_FAILED";
+            errorResponse["error"]["message"] = e.what();
+            errorResponse["traceId"] = traceId;
+            
+            return errorResponse;
         }
     }
     
@@ -134,20 +130,21 @@ private:
         auto now = chrono::system_clock::now();
         auto time_t = chrono::system_clock::to_time_t(now);
         
-        json logEntry = {
-            {"timestamp", put_time(gmtime(&time_t), "%Y-%m-%d %H:%M:%S")},
-            {"level", "INFO"},
-            {"message", "Price calculated"},
-            {"traceId", traceId},
-            {"details", {
-                {"distanceKm", round((request.distanceM / 1000.0) * 10) / 10.0},
-                {"etaMinutes", round((request.etaSec / 60.0) * 10) / 10.0},
-                {"vehicleClass", request.vehicleClass},
-                {"price", price},
-                {"classMultiplier", classMultiplier},
-                {"demandCoeff", demandCoeff}
-            }}
-        };
+        json logEntry;
+        logEntry["timestamp"] = put_time(gmtime(&time_t), "%Y-%m-%d %H:%M:%S");
+        logEntry["level"] = "INFO";
+        logEntry["message"] = "Price calculated";
+        logEntry["traceId"] = traceId;
+        
+        json details;
+        details["distanceKm"] = round((request.distanceM / 1000.0) * 10) / 10.0;
+        details["etaMinutes"] = round((request.etaSec / 60.0) * 10) / 10.0;
+        details["vehicleClass"] = request.vehicleClass;
+        details["price"] = price;
+        details["classMultiplier"] = classMultiplier;
+        details["demandCoeff"] = demandCoeff;
+        
+        logEntry["details"] = details;
         
         cout << logEntry.dump() << endl;
     }
@@ -219,26 +216,22 @@ int main() {
     
     // Health check endpoint
     server.Get("/healthz", [](const httplib::Request& req, httplib::Response& res) {
-        json response = {
-            {"status", "healthy"},
-            {"timestamp", getCurrentTimestamp()},
-            {"service", "pricing-core-cpp"}
-        };
+        json response;
+        response["status"] = "healthy";
+        response["timestamp"] = getCurrentTimestamp();
+        response["service"] = "pricing-core-cpp";
         
         res.set_content(response.dump(), "application/json");
     });
     
     // Ready check endpoint
     server.Get("/readyz", [&config](const httplib::Request& req, httplib::Response& res) {
-        json response = {
-            {"status", "ready"},
-            {"timestamp", getCurrentTimestamp()},
-            {"config", {
-                {"basePrice", config.base_price},
-                {"pricePerKm", config.price_per_km},
-                {"pricePerMinute", config.price_per_minute}
-            }}
-        };
+        json response;
+        response["status"] = "ready";
+        response["timestamp"] = getCurrentTimestamp();
+        response["config"]["basePrice"] = config.base_price;
+        response["config"]["pricePerKm"] = config.price_per_km;
+        response["config"]["pricePerMinute"] = config.price_per_minute;
         
         res.set_content(response.dump(), "application/json");
     });
@@ -259,14 +252,11 @@ int main() {
             PriceRequest priceRequest;
             
             if (!priceRequest.fromJson(requestJson)) {
-                json errorResponse = {
-                    {"data", nullptr},
-                    {"error", {
-                        {"code", "INVALID_REQUEST"},
-                        {"message", "Invalid request format"}
-                    }},
-                    {"traceId", traceId}
-                };
+                            json errorResponse;
+            errorResponse["data"] = nullptr;
+            errorResponse["error"]["code"] = "INVALID_REQUEST";
+            errorResponse["error"]["message"] = "Invalid request format";
+            errorResponse["traceId"] = traceId;
                 
                 res.status = 400;
                 res.set_content(errorResponse.dump(), "application/json");
@@ -275,14 +265,11 @@ int main() {
             
             // Валидация входных данных
             if (priceRequest.distanceM <= 0 || priceRequest.etaSec <= 0) {
-                json errorResponse = {
-                    {"data", nullptr},
-                    {"error", {
-                        {"code", "INVALID_PARAMETERS"},
-                        {"message", "Distance and ETA must be positive"}
-                    }},
-                    {"traceId", traceId}
-                };
+                            json errorResponse;
+            errorResponse["data"] = nullptr;
+            errorResponse["error"]["code"] = "INVALID_PARAMETERS";
+            errorResponse["error"]["message"] = "Distance and ETA must be positive";
+            errorResponse["traceId"] = traceId;
                 
                 res.status = 400;
                 res.set_content(errorResponse.dump(), "application/json");
@@ -296,28 +283,22 @@ int main() {
             res.set_header("X-Request-Id", traceId);
             res.set_content(priceResponse.dump(), "application/json");
             
-        } catch (const json::parse_error& e) {
-            json errorResponse = {
-                {"data", nullptr},
-                {"error", {
-                    {"code", "JSON_PARSE_ERROR"},
-                    {"message", "Invalid JSON format"}
-                }},
-                {"traceId", traceId}
-            };
+        } catch (const nlohmann::json::parse_error& e) {
+            json errorResponse;
+            errorResponse["data"] = nullptr;
+            errorResponse["error"]["code"] = "JSON_PARSE_ERROR";
+            errorResponse["error"]["message"] = "Invalid JSON format";
+            errorResponse["traceId"] = traceId;
             
             res.status = 400;
             res.set_content(errorResponse.dump(), "application/json");
             
         } catch (const exception& e) {
-            json errorResponse = {
-                {"data", nullptr},
-                {"error", {
-                    {"code", "INTERNAL_ERROR"},
-                    {"message", e.what()}
-                }},
-                {"traceId", traceId}
-            };
+            json errorResponse;
+            errorResponse["data"] = nullptr;
+            errorResponse["error"]["code"] = "INTERNAL_ERROR";
+            errorResponse["error"]["message"] = e.what();
+            errorResponse["traceId"] = traceId;
             
             res.status = 500;
             res.set_content(errorResponse.dump(), "application/json");

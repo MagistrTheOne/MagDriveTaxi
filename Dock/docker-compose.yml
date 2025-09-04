@@ -1,4 +1,4 @@
-version: "3.9"
+# Docker Compose для MagaDrive T8-T10
 
 networks:
   magadrive_net:
@@ -30,8 +30,8 @@ services:
         condition: service_healthy
       geo:
         condition: service_healthy
-      pricing:
-        condition: service_healthy
+      # pricing:  # Временно отключен
+      #   condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
       interval: 10s
@@ -82,22 +82,22 @@ services:
       - magadrive_net
     restart: unless-stopped
 
-  pricing:
-    build: ../Microservices/pricing_core_cpp
-    environment:
-      - ENV=dev
-      - PORT=8003
-      - BASE_PRICE=100.0
-      - PRICE_PER_KM=15.0
-      - PRICE_PER_MINUTE=3.0
-      - DEMAND_COEFF_MIN=1.0
-      - DEMAND_COEFF_MAX=1.4
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8003/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    networks:
-      - magadrive_net
-    restart: unless-stopped
+  # pricing:  # Временно отключен для тестирования Python сервисов
+  #   build: ../Microservices/pricing_core_cpp
+  #   environment:
+  #     - ENV=dev
+  #     - PORT=8003
+  #     - BASE_PRICE=100.0
+  #     - PRICE_PER_KM=15.0
+  #     - PRICE_PER_MINUTE=3.0
+  #     - DEMAND_COEFF_MIN=1.0
+  #     - DEMAND_COEFF_MAX=1.4
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-fsS", "http://localhost:8003/healthz"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 12
+  #     start_period: 10s
+  #   networks:
+  #     - magadrive_net
+  #   restart: unless-stopped

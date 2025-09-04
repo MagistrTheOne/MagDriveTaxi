@@ -35,7 +35,8 @@ class CustomFormatter(logging.Formatter):
         return super().format(record)
 
 logger = logging.getLogger(__name__)
-logger.handlers[0].setFormatter(CustomFormatter())
+if logger.handlers:
+    logger.handlers[0].setFormatter(CustomFormatter())
 
 # Конфигурация
 MAPTILER_API_KEY = os.getenv('MAPTILER_API_KEY', 'SjhYKAeXJxWy3pPcQc2G')
