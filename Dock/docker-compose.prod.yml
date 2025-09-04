@@ -1,0 +1,75 @@
+version: "3.9"
+
+services:
+  gateway:
+    build:
+      context: ../Microservices/api-gateway_py
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8000"
+    environment:
+      - RIDE_SERVICE_URL=http://ride:8001
+      - GEO_SERVICE_URL=http://geo:8002
+      - PRICING_SERVICE_URL=http://pricing:7010
+      - ENVIRONMENT=production
+    depends_on:
+      - ride
+      - geo
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  ride:
+    build:
+      context: ../Microservices/ride_service_py
+      dockerfile: Dockerfile
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=sqlite:///data/rides.db
+    volumes:
+      - ride_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  geo:
+    build:
+      context: ../Microservices/geo_service_py
+      dockerfile: Dockerfile
+    environment:
+      - ENVIRONMENT=production
+      - MAPTILER_API_KEY=${MAPTILER_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # Pricing service временно отключен для production
+  # pricing:
+  #   build:
+  #     context: ../Microservices/pricing_core_cpp
+  #     dockerfile: Dockerfile
+  #   environment:
+  #     - ENVIRONMENT=production
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:7010/healthz"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 40s
+  #   restart: unless-stopped
+
+volumes:
+  ride_data:
+    driver: local

@@ -1,0 +1,22 @@
+# Railway Production Dockerfile
+FROM docker/compose:2.20.2
+
+# Установка зависимостей
+RUN apk add --no-cache \
+    curl \
+    bash \
+    git
+
+# Копирование файлов
+COPY . /app
+WORKDIR /app
+
+# Установка прав
+RUN chmod +x docker-compose.yml
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/healthz || exit 1
+
+# Запуск сервисов
+CMD ["docker-compose", "up", "-d"]
