@@ -1,4 +1,4 @@
-package com.magadrive.magadrive_frontend
+package com.magadrive.app
 
 import io.flutter.embedding.android.FlutterActivity
 

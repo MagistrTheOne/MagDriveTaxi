@@ -1,5 +1,5 @@
-name: magadrive_frontend
-description: MagaDrive Luxury Taxi MVP - Flutter Frontend
+name: magadrive
+description: MagaDrive Luxury Taxi 
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -19,6 +19,7 @@ dependencies:
   # State Management
   provider: ^6.1.1
   riverpod: ^2.4.9
+  equatable: ^2.0.5
   
   # Maps & Location
   maplibre_gl: ^0.22.0
@@ -65,15 +66,3 @@ flutter:
   
   assets:
     - assets/map/
-    - assets/images/
-    - assets/icons/
-    - assets/animations/
-  
-  fonts:
-    - family: Roboto
-      fonts:
-        - asset: assets/fonts/Roboto-Regular.ttf
-        - asset: assets/fonts/Roboto-Bold.ttf
-          weight: 700
-        - asset: assets/fonts/Roboto-Medium.ttf
-          weight: 500
